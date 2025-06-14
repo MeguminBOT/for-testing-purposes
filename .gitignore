@@ -1,0 +1,9 @@
+app_config.cfg
+testsprite/
+output/
+App/
+experimental features/
+testsprite(errors)/
+__pycache__/
+.vs/
+env/
