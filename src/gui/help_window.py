@@ -1,93 +1,174 @@
-import tkinter as tk
-from tkinter import ttk
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
-class HelpWindow:
+from PySide6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QTextEdit
+from PySide6.QtGui import QFont
+
+
+class HelpWindow(QDialog):
     """
-    A window class for displaying help and documentation for the application.
+    A Qt dialog for displaying quick help and documentation for the application.
 
-    This class provides static methods to create scrollable help windows with detailed instructions
+    This class provides scrollable help windows with detailed instructions
     and guidance for using the application, including special advice for FNF (Friday Night Funkin') sprites.
-
-    Methods:
-        create_scrollable_help_window(help_text, title="Help"):
-            Creates a scrollable help window with the provided help text and title.
-        create_main_help_window():
-            Opens the main help window with instructions and feature descriptions.
-        create_fnf_help_window():
-            Opens a help window with guidance specific to FNF sprites and settings.
     """
 
+    def __init__(self, parent=None, help_text="", title="Help"):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setGeometry(200, 200, 800, 600)
+        self.help_text = help_text
+        self.setup_ui()
+
+    def tr(self, text):
+        """Translation helper method."""
+        from PySide6.QtCore import QCoreApplication
+
+        return QCoreApplication.translate(self.__class__.__name__, text)
+
+    def setup_ui(self):
+        """Sets up the UI components."""
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+        layout.setContentsMargins(20, 20, 20, 20)
+
+        # Help text area
+        text_edit = QTextEdit()
+        text_edit.setPlainText(self.help_text)
+        text_edit.setReadOnly(True)
+        text_edit.setFont(QFont("Consolas", 10))  # Monospace font for better formatting
+        layout.addWidget(text_edit)
+
+        # Close button
+        close_btn = QPushButton(self.tr("Close"))
+        close_btn.clicked.connect(self.close)
+        close_btn.setMaximumWidth(100)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        btn_layout.addWidget(close_btn)
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
+
     @staticmethod
-    def create_scrollable_help_window(help_text, title="Help"):
-        help_window = tk.Toplevel()
-        help_window.geometry("800x600")
-        help_window.title(title)
-
-        main_frame = ttk.Frame(help_window)
-        main_frame.pack(fill=tk.BOTH, expand=1)
-
-        canvas = tk.Canvas(main_frame)
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=1)
-
-        scrollbar = ttk.Scrollbar(main_frame, orient=tk.VERTICAL, command=canvas.yview)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-
-        canvas.configure(yscrollcommand=scrollbar.set)
-        canvas.bind('<Configure>', lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-
-        scrollable_frame = ttk.Frame(canvas)
-        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-
-        help_label = tk.Label(scrollable_frame, text=help_text, justify="left", padx=10, pady=10, wraplength=780)
-        help_label.pack()
-
-    @staticmethod
-    def create_main_help_window():
+    def create_main_help_window(parent=None):
+        """Opens the main help window with instructions and feature descriptions."""
         help_text = (
             "_________________________________________ Main Window _________________________________________\n\n"
-            "Double clicking a spritesheet entry will open up a window where you can override the global settings and customize indices used for all the animations in that spritesheet.\n\n"
-            "Double clicking an animation entry will open up a window where you can override the global and spritesheets' and customize indices used for that animation.\n\n"
-            "Select directory with spritesheets:\nOpens a file dialog for you to choose a folder containing the spritesheets you want to process.\n\n"
-            "Select save directory:\nOpens a file dialog for you to specify where the application should save the exported frames and animated images.\n\n\n"
-            "Animation format:\nChoose the output format for animated images, currently supports GIF, WebP and APNG\n\n"
-            "Frame rate (fps):\nDefines the playback speed of the animated image in frames per second.\n\n"
-            "Loop delay (ms):\nSets the minimum delay time, in milliseconds, before the animation loops again.\n\n"
-            "Minimum period (ms):\nSets the minimum duration, in milliseconds, before the animation loops again.\n\n"
-            "Scale:\nResizes frames and animations using nearest-neighbor interpolation to preserve pixels. Negative numbers flip the sprites horizontally.\n\n"
-            "Alpha threshold (GIFs only):\nThis setting adjusts the level of transparency applied to pixels in GIF images.\nThe threshold value determines the cutoff point for transparency.\nPixels with an alpha value below this threshold become fully transparent, while those above the threshold become fully opaque.\n\n"
-            "Indices (not available in global settings):\nSelect the frame indices to use in the animation by typing a comma-separated list of non-negative integers.\n\n\n"
-            "Keep individual frames:\nWheter to keep exported frames as PNGs.\nThis option has a few presets like 'No duplicates', you can also directly enter a comma-separated list of integers or integer ranges. Negative numbers count from the final frame\n\n"
-            "Cropping method:\nWheter to crop exported images.\n'Animation based' finds the smallest possible size for the entire animation.\n'Frame based' finds the smallest possible size for each frame *Only applied on exported pngs*.\n'None' turns cropping off.\n\n"
-            "Filename prefix:\nSets a prefix to the filenames of the exported images.\n\n"
-            "Filename format:\nChoose how filenames are formatted when exported images.\n'Standardized' keeps names clean with spaces and dashes, example: 'Prefix - Sprite - Animation'\n\n"
-            "Find and replace:\nAllows you to find and replace specific text in the filenames of the exported images.\nAlso supports the usage of 'Regular Expression' (Regex), a powerful way to search using patterns.\n\n"
-            "Show user settings:\nOpens a window displaying a list of animations and spritesheets with settings that override the global configuration.\n\n"
-            "Start process:\nBegins the exporting process.\n\n"
-            "_________________________________________ Menubar: File _________________________________________\n\n"
-            "Select directory:\nOpens a file dialog for you to choose a folder containing the spritesheets you want to process.\n\n"
-            "Select Files:\nOpens a file dialog for you to manually choose spritesheet .XML/TXT and .PNG files.\n\n"
-            "Clear Filelist and User settings:\nRemoves all entries from the list and clears the settings.\n\n"
-            "Exit:\nExits the application\n\n"
-            "_________________________________________ Menubar: Import _________________________________________\n\n"
-            "(FNF) Import settings from character data file:\nOpens a file dialog for you to choose the folder containing the data files of your characters, attempting to automatically set the correct settings of each animation. Supports Psych Engine, Codename Engine and Kade Engine.\n\n"
-            "_________________________________________ Menubar: Advanced _________________________________________\n\n"
-            "Variable Delay:\nWhen enabled, vary the delays of each frame slightly to more accurately reach the desired fps.\n\n"
-            "Use all CPU threads:\nWhen checked, the application utilizes all available CPU threads. When unchecked, it uses only half of the available CPU threads.\n\n"
-            "(FNF) Set idle loop delay to 0:\nSets all animations containing the phrase 'idle' to have no delay before looping. Usually recommended.\n\n"
+            "DRAG AND DROP\n"
+            "You can drag and drop a folder containing PNG files and their data files into the window.\n"
+            "This will automatically populate the PNG and animation lists.\n\n"
+            "INPUT SELECTION\n"
+            "• Select Directory: Choose a folder containing PNG files and their corresponding data files\n"
+            "• Select Files: Manually choose specific PNG files to process\n\n"
+            "OUTPUT SETTINGS\n"
+            "• Select an output directory where exported animations and frames will be saved\n\n"
+            "ANIMATION FORMATS\n"
+            "• GIF: Traditional animated format, supports transparency threshold\n"
+            "• WebP: Modern format with better compression and quality\n"
+            "• APNG: Animated PNG with full alpha channel support\n"
+            "• Custom FFMPEG: Use custom FFMPEG commands for advanced formats\n\n"
+            "FRAME FORMATS\n"
+            "• PNG: Lossless with full transparency support\n"
+            "• WebP: Modern format with excellent compression\n"
+            "• AVIF: Next-generation format with superior compression\n"
+            "• TGA, TIFF, BMP, DDS: Additional format options\n\n"
+            "ANIMATION SETTINGS\n"
+            "• Frame Rate: Playback speed in frames per second\n"
+            "• Loop Delay: Pause before animation repeats (milliseconds)\n"
+            "• Minimum Period: Minimum total animation duration\n"
+            "• Scale: Resize factor for output animations\n"
+            "• Alpha Threshold: Transparency cutoff for GIF format\n\n"
+            "FRAME SETTINGS\n"
+            "• Frame Selection: Choose which frames to export (All, No duplicates, First, Last, etc.)\n"
+            "• Frame Scale: Resize factor for individual frames\n"
+            "• Compression: Format-specific quality settings\n\n"
+            "CROPPING OPTIONS\n"
+            "• None: Keep original frame dimensions\n"
+            "• Animation Based: Crop to the bounds of all frames in animation\n"
+            "• Frame Based: Crop each frame individually\n\n"
+            "FILENAME OPTIONS\n"
+            "• Prefix/Suffix: Add text before or after filenames\n"
+            "• Format: Choose naming convention (Standardized, No spaces, No special chars)\n"
+            "• Advanced: Use find/replace rules for custom filename processing\n\n"
+            "OVERRIDE SETTINGS\n"
+            "• Override Spritesheet Settings: Custom settings for specific PNG files\n"
+            "• Override Animation Settings: Custom settings for specific animations\n"
+            "• Show Override Settings: View all current custom settings\n\n"
+            "PROCESSING\n"
+            "1. Select input directory or files\n"
+            "2. Select output directory\n"
+            "3. Configure animation and frame settings\n"
+            "4. Click 'Start Process' to begin extraction\n\n"
+            "LIST OPERATIONS\n"
+            "• Single-click a PNG file to view its animations\n"
+            "• Double-click an animation to preview it\n"
+            "• Right-click a PNG file to delete it from the list\n\n"
+            "KEYBOARD SHORTCUTS\n"
+            "• Ctrl+O: Open directory\n"
+            "• Ctrl+Shift+O: Open files\n"
+            "• F1: Show this help\n"
+            "• Escape: Cancel current operation\n\n"
         )
-        HelpWindow.create_scrollable_help_window(help_text, "Help")
+
+        window = HelpWindow(parent, help_text, "Main Help")
+        window.exec()
 
     @staticmethod
-    def create_fnf_help_window():
-        fnf_help_text = (
-            "Use the 'FNF: Import settings character data files' option in the Import menu,\nThis will attempt to get the correct frame rate, delay, scale and indices for each character and animation.\n(Make sure you select spritesheet directory first)\n\n"
-            "Use the 'FNF: Set idle loop delay to 0' option in the Advanced menu,\nThis will set all animations containing the phrase 'idle' to have no delay before looping. Usually recommended.\n\n"
-            "If those options don't work for you, you can manually set the settings for each animation. Here's some general guidelines for the delay below:\n\n"
-            "Loop delay:\n"
-            "For anything that doesn't need to smoothly loop like sing poses for characters, 250 ms is recommended (100 ms minimum)\n"
-            "Idle animations usually looks best with 0\n"
-            "Idle animations usually looks best with 0, some do look better with 150-250ms.\n"
-            "If unsure about the loop delay, start by leaving it at default, start processing, then inspect the generated gifs.\n"
-            "Doesn't look good? Just double click the animation name in the application and change the delay and start processing again."
+    def create_fnf_help_window(parent=None):
+        """Opens a help window with guidance specific to FNF sprites and settings."""
+        help_text = (
+            "________________________________ Friday Night Funkin' Guide ________________________________\n\n"
+            "SPECIAL FNF FEATURES\n"
+            "This application includes special support for Friday Night Funkin' (FNF) character sprites.\n\n"
+            "IMPORTING FNF CHARACTER DATA\n"
+            "• Use 'Import → FNF: Import settings from character data file'\n"
+            "• Select a character's JSON data file\n"
+            "• Animation settings will be automatically configured\n\n"
+            "FNF SPRITE STRUCTURE\n"
+            "FNF characters typically include:\n"
+            "• PNG spritesheet file (e.g., 'BOYFRIEND.png')\n"
+            "• XML data file (e.g., 'BOYFRIEND.xml')\n"
+            "• JSON character data (e.g., 'BOYFRIEND.json')\n\n"
+            "RECOMMENDED SETTINGS FOR FNF\n"
+            "Animation Format: WebP or APNG (better quality than GIF)\n"
+            "Frame Rate: 24 FPS (standard for FNF)\n"
+            "Loop Delay: 0 ms for idle animations, 250ms+ for others\n"
+            "Scale: 1.0x (maintain original size)\n"
+            "Cropping: Animation Based (removes empty space)\n\n"
+            "FNF ANIMATION TYPES\n"
+            "• Idle: Continuous looping character stance\n"
+            "• Sing: Note-hitting animations (left, down, up, right)\n"
+            "• Miss: Failed note animations\n"
+            "• Hey: Special gesture animations\n\n"
+            "BATCH PROCESSING FNF CHARACTERS\n"
+            "1. Place all character folders in one directory\n"
+            "2. Use 'Select Directory' to process multiple characters\n"
+            "3. Set global animation settings\n"
+            "4. Use override settings for character-specific adjustments\n\n"
+            "FNF-SPECIFIC TIPS\n"
+            "• Enable 'No duplicates' frame selection to reduce file sizes\n"
+            "• Use variable delay for more natural animation timing\n"
+            "• Consider APNG format for characters with complex transparency\n"
+            "• Export both animations and individual frames for modding flexibility\n\n"
+            "TROUBLESHOOTING FNF IMPORTS\n"
+            "• Ensure XML and PNG files have matching names\n"
+            "• Check that JSON character data is properly formatted\n"
+            "• Verify animation names match between XML and JSON files\n"
+            "• Use 'Show Override Settings' to review imported configurations\n\n"
+            "MODDING COMPATIBILITY\n"
+            "Exported animations work with:\n"
+            "• Psych Engine\n"
+            "• Kade Engine\n"
+            "• Base FNF\n"
+            "• Most FNF mods and engines\n\n"
         )
-        HelpWindow.create_scrollable_help_window(fnf_help_text, "Help (FNF Sprites)")
+
+        window = HelpWindow(parent, help_text, "FNF Help")
+        window.exec()
+
+    @staticmethod
+    def create_scrollable_help_window(help_text, title="Help", parent=None):
+        """Creates a scrollable help window with the provided help text and title."""
+        window = HelpWindow(parent, help_text, title)
+        window.exec()

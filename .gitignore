@@ -7,3 +7,6 @@ testsprite(errors)/
 __pycache__/
 .vs/
 env/
+_build-output/
+_logs/
+_src/logs

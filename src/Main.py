@@ -1,592 +1,891 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import sys
 import os
-import platform
 import shutil
 import tempfile
-import threading
-import tkinter as tk
-import webbrowser
-import argparse
-from tkinter import filedialog, ttk, messagebox
+from pathlib import Path
+
+from PySide6.QtWidgets import QApplication, QMainWindow, QFileDialog, QMessageBox
+from PySide6.QtCore import QThread, Signal, QTimer, Qt, QCoreApplication
+from PySide6.QtGui import QIcon, QAction
 
 # Import our own modules
 from utils.dependencies_checker import DependenciesChecker
-DependenciesChecker.check_and_configure_imagemagick()
-from utils.app_config import AppConfig
-from utils.update_checker import UpdateChecker
-from utils.settings_manager import SettingsManager
-from utils.utilities import Utilities
-from utils.fnf_utilities import FnfUtilities
-from parsers.xml_parser import XmlParser 
-from parsers.txt_parser import TxtParser
-from core.extractor import Extractor
-from gui.app_config_window import AppConfigWindow
-from gui.help_window import HelpWindow
-from gui.find_replace_window import FindReplaceWindow
-from gui.override_settings_window import OverrideSettingsWindow
-from gui.gif_preview_window import GifPreviewWindow
-from gui.settings_window import SettingsWindow
 
-class TextureAtlasExtractorApp:
+DependenciesChecker.check_and_configure_imagemagick()  # This function must be called before any other operations that require ImageMagick (DO NOT MOVE THIS IMPORT LINE)
+from utils.app_config import AppConfig  # noqa: E402
+from utils.update_checker import UpdateChecker  # noqa: E402
+from utils.settings_manager import SettingsManager  # noqa: E402
+from utils.fnf_utilities import FnfUtilities  # noqa: E402
+from core.extractor import Extractor  # noqa: E402
+from gui.app_ui import Ui_TextureAtlasToolboxApp  # noqa: E402
+from gui.app_config_window import AppConfigWindow  # noqa: E402
+from gui.settings_window import SettingsWindow  # noqa: E402
+from gui.find_replace_window import FindReplaceWindow  # noqa: E402
+from gui.help_window import HelpWindow  # noqa: E402
+from gui.contributors_window import ContributorsWindow  # noqa: E402
+from gui.processing_window import ProcessingWindow  # noqa: E402
+from gui.compression_settings_window import CompressionSettingsWindow  # noqa: E402
+from gui.machine_translation_disclaimer_dialog import MachineTranslationDisclaimerDialog  # noqa: E402
+
+
+class ExtractorWorker(QThread):
+    """Worker thread for extraction process."""
+
+    progress_updated = Signal(int, int, str)  # current, total, filename
+    statistics_updated = Signal(
+        int, int, int
+    )  # frames_generated, animations_generated, sprites_failed
+    debug_message = Signal(str)  # debug message for processing log
+    extraction_completed = Signal(str)  # completion message
+    extraction_failed = Signal(str)
+    error_occurred = Signal(str, str)  # title, message
+    question_needed = Signal(str, str)  # title, message
+
+    def __init__(self, app_instance, spritesheet_list):
+        super().__init__()
+        self.app_instance = app_instance
+        self.spritesheet_list = spritesheet_list
+        self.continue_on_error = True
+
+    def run(self):
+        try:
+            print(f"[ExtractorWorker] Starting extraction of {len(self.spritesheet_list)} files")
+            completion_message = self.app_instance.run_extractor_core(
+                self.spritesheet_list, self.emit_progress
+            )
+            print(f"[ExtractorWorker] Extraction completed: {completion_message}")
+            self.extraction_completed.emit(completion_message)
+        except Exception as e:
+            print(f"[ExtractorWorker] Extraction failed: {str(e)}")
+            self.extraction_failed.emit(str(e))
+
+    def emit_progress(self, current, total, filename=""):
+        """Thread-safe progress emission."""
+        print(f"[ExtractorWorker] Progress: {current}/{total} - {filename}")
+        self.progress_updated.emit(current, total, filename)
+
+    def emit_statistics(self, frames_generated, animations_generated, sprites_failed):
+        """Thread-safe statistics emission."""
+        print(
+            f"[ExtractorWorker] Stats: F:{frames_generated}, A:{animations_generated}, S:{sprites_failed}"
+        )
+        self.statistics_updated.emit(frames_generated, animations_generated, sprites_failed)
+
+
+class TextureAtlasExtractorApp(QMainWindow):
     """
-    A GUI application for extracting textures from a texture atlas and converting them to GIF and WebP formats.
-
-    Attributes:
-        root (tk.Tk): The root window of the application.
-
-        current_version (str): The current version of the application.
-        app_config (AppConfig): Application configuration instance for persistent app settings.
-        settings_manager (SettingsManager): Manages global, animation-specific, and spritesheet-specific settings.
-        temp_dir (str): A temporary directory for storing files.
-        data_dict (dict): A dictionary to store data related to the spritesheets.
-        fnf_utilities (FnfUtilities): An instance of FnfUtilities for FNF-related utilities.
-        fnf_char_json_directory (str): Directory for FNF character JSON files.
-        replace_rules (list): List of find/replace rules.
-        linkSourceCode (str): URL to the source code.
-
-        progress_var (tk.DoubleVar): A variable to track progress for the progress bar.
-        progress_bar (ttk.Progressbar): The progress bar widget.
-        menubar (tk.Menu): The main menu bar.
-        variable_delay (tk.BooleanVar): A flag to enable or disable variable delay between frames.
-        fnf_idle_loop (tk.BooleanVar): A flag to set loop delay to 0 for idle animations in FNF.
-        scrollbar_png (tk.Scrollbar): Scrollbar for the PNG listbox.
-        listbox_png (tk.Listbox): Listbox for PNG files.
-        scrollbar_xml (tk.Scrollbar): Scrollbar for the data listbox.
-        listbox_data (tk.Listbox): Listbox for animation/data files.
-        listbox_png_menu (tk.Menu): Context menu for the PNG listbox.
-        input_dir (tk.StringVar): Input directory variable.
-        input_button (tk.Button): Button to select input directory.
-        input_dir_label (tk.Label): Label showing the selected input directory.
-        output_dir (tk.StringVar): Output directory variable.
-        output_button (tk.Button): Button to select output directory.
-        output_dir_label (tk.Label): Label showing the selected output directory.
-        animation_format (tk.StringVar): Animation format variable.
-        animation_format_label (tk.Label): Label for animation format.
-        animation_format_combobox (ttk.Combobox): Combobox for animation format selection.
-        set_framerate (tk.DoubleVar): Frame rate variable.
-        frame_rate_label (tk.Label): Label for frame rate.
-        frame_rate_entry (tk.Entry): Entry for frame rate.
-        set_loopdelay (tk.DoubleVar): Loop delay variable.
-        loopdelay_label (tk.Label): Label for loop delay.
-        loopdelay_entry (tk.Entry): Entry for loop delay.
-        set_minperiod (tk.DoubleVar): Minimum period variable.
-        minperiod_label (tk.Label): Label for minimum period.
-        minperiod_entry (tk.Entry): Entry for minimum period.
-        set_scale (tk.DoubleVar): Scale variable.
-        scale_label (tk.Label): Label for scale.
-        scale_entry (tk.Entry): Entry for scale.
-        set_threshold (tk.DoubleVar): Alpha threshold variable.
-        threshold_label (tk.Label): Label for alpha threshold.
-        threshold_entry (tk.Entry): Entry for alpha threshold.
-        keep_frames (tk.StringVar): Option for keeping frames.
-        keepframes_label (tk.Label): Label for keep frames option.
-        keepframes_menu (ttk.Combobox): Combobox for keep frames option.
-        crop_option (tk.StringVar): Cropping method variable.
-        crop_menu_label (tk.Label): Label for cropping method.
-        crop_menu_menu (ttk.Combobox): Combobox for cropping method.
-        prefix_label (tk.Label): Label for filename prefix.
-        prefix (tk.StringVar): Filename prefix variable.
-        prefix_entry (tk.Entry): Entry for filename prefix.
-        filename_format (tk.StringVar): Filename format variable.
-        filename_format_label (tk.Label): Label for filename format.
-        filename_format_menu (ttk.Combobox): Combobox for filename format.
-        replace_button (tk.Button): Button to open find and replace window.
-        button_frame (tk.Frame): Frame for bottom buttons.
-        show_user_settings (tk.Button): Button to show user settings.
-        process_button (tk.Button): Button to start processing.
-        author_label (tk.Label): Label for author credit.
-        link1 (tk.Label): Label with clickable link to source code.
-
-    Methods:
-        setup_gui(): Sets up the GUI components of the application.
-        setup_menus(): Sets up the menu bar and its items.
-        setup_widgets(): Sets up the widgets in the main window.
-        contributeLink(linkSourceCode): Opens the source code link in a web browser.
-        check_version(): Checks for updates to the application and prompts the user if the user wants to update.
-        check_dependencies(): Checks and configures dependencies.
-        create_app_config_window(): Creates the options window for setting CPU/memory limits and other persistent app settings via AppConfig.
-        clear_filelist(): Clears the file list and resets animation and spritesheet settings.
-        select_directory(variable, label): Opens a directory selection dialog and updates the label.
-        select_files_manually(variable, label): Opens a file selection dialog and updates the label.
-        create_settings_window(): Creates a window to display animation and spritesheet settings.
-        create_find_and_replace_window(): Creates the Find and Replace window.
-        store_replace_rules(rules): Stores the replace rules from the Find and Replace window.
-        create_override_settings_window(window, name, settings_type): Creates a window to edit animation or spritesheet settings.
-        on_select_spritesheet(evt): Handles the event when a PNG file is selected from the listbox.
-        on_double_click_spritesheet(evt): Handles the event when a PNG file is double-clicked in the listbox.
-        on_double_click_animation(evt): Handles the event when an animation is double-clicked in the listbox.
-        show_listbox_png_menu(event): Shows the context menu for the PNG listbox.
-        delete_selected_spritesheet(): Deletes the selected spritesheet and related settings.
-        preview_gif_window(...): Generates and displays a preview GIF.
-        show_gif_preview_window(gif_path, settings): Displays the preview GIF in a new window.
-        store_input(...): Stores the input from the override settings window.
-        update_global_settings(): Updates the global settings from the GUI.
-        on_closing(): Handles the event when the application is closing.
-        start_process(): Prepares and starts the processing thread.
-        run_extractor(): Starts the process of extracting textures and converting them to GIF and WebP formats.
+    A Qt/PySide6 GUI application for extracting textures from a texture atlas and converting them to GIF, WebP, and APNG formats.
     """
 
-    def __init__(self, root):
-        self.root = root
-        self.current_version = '1.9.4'
+    def tr(self, text):
+        """Translate text using Qt's translation system."""
+        return QCoreApplication.translate("TextureAtlasExtractorApp", text)
+
+    def __init__(self):
+        super().__init__()
+
+        # Initialize core attributes
+        self.current_version = "2.0.0"
         self.app_config = AppConfig()
         self.settings_manager = SettingsManager()
         self.temp_dir = tempfile.mkdtemp()
+        self.manual_selection_temp_dir = (
+            None  # For storing temp directory used in manual file selection
+        )
         self.data_dict = {}
+
+        # Initialize translation manager and load language
+        from utils.translation_manager import get_translation_manager
+
+        self.translation_manager = get_translation_manager()
+        effective_language = self.app_config.get_effective_language()
+        self.translation_manager.load_translation(effective_language)
 
         self.fnf_utilities = FnfUtilities()
         self.fnf_char_json_directory = ""
+        self.replace_rules = []
+        self.linkSourceCode = "https://github.com/MeguminBOT/TextureAtlas-to-GIF-and-Frames"
 
+        # Initialize UI
+        self.ui = Ui_TextureAtlasToolboxApp()
+        self.ui.setupUi(self)
+
+        # Initialize advanced menu variables
+        defaults = (
+            self.app_config.get_extraction_defaults()
+            if hasattr(self.app_config, "get_extraction_defaults")
+            else {}
+        )
+        self.variable_delay = defaults.get("variable_delay", False)
+        self.fnf_idle_loop = defaults.get("fnf_idle_loop", False)
+
+        self.setup_advanced_menu()
         self.setup_gui()
-        self.check_version()
+        self.setup_extract_tab()
+        self.setup_generate_tab()
+        self.setup_connections()
+        self.ui.retranslateUi(self)
+
+        self._startup_update_timer = QTimer(self)
+        self._startup_update_timer.setSingleShot(True)
+        self._startup_update_timer.timeout.connect(self._run_startup_update_check)
+        self._startup_update_timer.start(500)
+
+    def setup_advanced_menu(self):
+        """Set up the advanced menu with variable delay and FNF options."""
+        # Create variable delay action
+        self.variable_delay_action = QAction(self.tr("Variable delay"), self, checkable=True)
+        self.variable_delay_action.setChecked(self.variable_delay)
+        self.variable_delay_action.setStatusTip(
+            self.tr("Enable variable delay between frames for more accurate timing")
+        )
+
+        # Create FNF idle loop action
+        self.fnf_idle_loop_action = QAction(
+            self.tr("FNF: Set loop delay on idle animations to 0"), self, checkable=True
+        )
+        self.fnf_idle_loop_action.setChecked(self.fnf_idle_loop)
+        self.fnf_idle_loop_action.setStatusTip(
+            self.tr("Automatically set loop delay to 0 for animations with 'idle' in their name")
+        )
+
+        # Add actions to advanced menu
+        self.ui.advanced_menu.addAction(self.variable_delay_action)
+        self.ui.advanced_menu.addAction(self.fnf_idle_loop_action)
+
+        # Add language selection to options menu
+        self.language_action = QAction(self.tr("Language..."), self, checkable=False)
+        self.language_action.setStatusTip(self.tr("Change application language"))
+        self.language_action.triggered.connect(self.show_language_selection)
+        self.ui.options_menu.addSeparator()
+        self.ui.options_menu.addAction(self.language_action)
+
+    def setup_generate_tab(self):
+        """Set up the Generate tab with proper functionality."""
+        from gui.generate_tab_widget import GenerateTabWidget
+
+        # Remove old label if it exists
+        if hasattr(self.ui, "label") and self.ui.label:
+            self.ui.label.setParent(None)
+
+        # Create the generate tab widget and pass the UI reference
+        self.generate_tab_widget = GenerateTabWidget(self.ui, self)
+
+        print("Generate tab setup completed successfully")
+
+    def setup_extract_tab(self):
+        """Set up the Extract tab with proper functionality."""
+        from gui.extract_tab_widget import ExtractTabWidget
+
+        self.extract_tab_widget = ExtractTabWidget(self, use_existing_ui=True)
+
+        print("Extract tab setup completed successfully")
+        self.ui.frame_format_combobox = self.extract_tab_widget.frame_format_combobox
+        self.ui.frame_rate_entry = self.extract_tab_widget.frame_rate_entry
+        self.ui.loop_delay_entry = self.extract_tab_widget.loop_delay_entry
+        self.ui.min_period_entry = self.extract_tab_widget.min_period_entry
+        self.ui.scale_entry = self.extract_tab_widget.scale_entry
+        self.ui.threshold_entry = self.extract_tab_widget.threshold_entry
+        self.ui.frame_scale_entry = self.extract_tab_widget.frame_scale_entry
+        self.ui.frame_selection_combobox = self.extract_tab_widget.frame_selection_combobox
+        self.ui.cropping_method_combobox = self.extract_tab_widget.cropping_method_combobox
+        self.ui.filename_format_combobox = self.extract_tab_widget.filename_format_combobox
+        self.ui.filename_prefix_entry = self.extract_tab_widget.filename_prefix_entry
+        self.ui.filename_suffix_entry = self.extract_tab_widget.filename_suffix_entry
+        self.ui.input_button = self.extract_tab_widget.input_button
+        self.ui.output_button = self.extract_tab_widget.output_button
+        self.ui.start_process_button = self.extract_tab_widget.start_process_button
+        self.ui.reset_button = self.extract_tab_widget.reset_button
+        self.ui.advanced_filename_button = self.extract_tab_widget.advanced_filename_button
+        self.ui.show_override_settings_button = (
+            self.extract_tab_widget.show_override_settings_button
+        )
+        self.ui.override_spritesheet_settings_button = (
+            self.extract_tab_widget.override_spritesheet_settings_button
+        )
+        self.ui.override_animation_settings_button = (
+            self.extract_tab_widget.override_animation_settings_button
+        )
+        self.ui.compression_settings_button = self.extract_tab_widget.compression_settings_button
+
+        print("Extract tab setup completed successfully")
 
     def setup_gui(self):
-        self.root.title(f"TextureAtlas to GIF and Frames v{self.current_version}")
-        self.root.geometry("900x720")
-        self.root.resizable(False, False)
-        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+        """Sets up the GUI components of the application."""
+        self.setWindowTitle(
+            self.tr("TextureAtlas Toolbox v{version}").format(version=self.current_version)
+        )
+        self.resize(900, 770)
 
+        # Set application icon if available
+        icon_path = Path("assets/icon.ico")
+        if icon_path.exists():
+            self.setWindowIcon(QIcon(str(icon_path)))
+
+        # Initialize directory labels with translated text
+        self.ui.input_dir_label.setText(self.tr("No input directory selected"))
+        self.ui.output_dir_label.setText(self.tr("No output directory selected"))
+
+        # Initialize default values from app config
+        defaults = (
+            self.app_config.get_extraction_defaults()
+            if hasattr(self.app_config, "get_extraction_defaults")
+            else {}
+        )
+
+        # Set default values for UI elements
+        self.ui.frame_rate_entry.setValue(defaults.get("frame_rate", 24))
+        self.ui.loop_delay_entry.setValue(defaults.get("loop_delay", 250))
+        self.ui.min_period_entry.setValue(defaults.get("min_period", 0))
+        self.ui.scale_entry.setValue(defaults.get("scale", 1.0))
+        self.ui.threshold_entry.setValue(
+            defaults.get("threshold", 0.5) * 100.0
+        )  # Convert from 0-1 to 0-100 for UI
+        self.ui.frame_scale_entry.setValue(defaults.get("frame_scale", 1.0))
+
+        # Set default groupbox states
+        self.ui.animation_export_group.setChecked(defaults.get("animation_export", True))
+        self.ui.frame_export_group.setChecked(defaults.get("frame_export", True))
+
+        # Set default selections using index mapping to avoid translation issues
+        if "animation_format" in defaults:
+            animation_format_map = ["GIF", "WebP", "APNG", "Custom FFMPEG"]
+            try:
+                format_index = animation_format_map.index(defaults["animation_format"])
+            except ValueError:
+                format_index = 0  # Default to GIF
+            self.ui.animation_format_combobox.setCurrentIndex(format_index)
+
+        if "frame_format" in defaults:
+            frame_format_map = ["AVIF", "BMP", "DDS", "PNG", "TGA", "TIFF", "WebP"]
+            try:
+                format_index = frame_format_map.index(defaults["frame_format"])
+            except ValueError:
+                format_index = 3  # Default to PNG
+            self.ui.frame_format_combobox.setCurrentIndex(format_index)
+
+    def setup_connections(self):
+        """Sets up signal-slot connections for UI elements."""
+        # Menu actions - connect to extract tab widget methods
+        self.ui.select_directory.triggered.connect(self.extract_tab_widget.select_directory)
+        self.ui.select_files.triggered.connect(self.extract_tab_widget.select_files_manually)
+        self.ui.clear_export_list.triggered.connect(self.extract_tab_widget.clear_filelist)
+        self.ui.preferences.triggered.connect(self.create_app_config_window)
+        self.ui.fnf_import_settings.triggered.connect(self.fnf_import_settings)
+        self.ui.help_manual.triggered.connect(self.show_help_manual)
+        self.ui.help_fnf.triggered.connect(self.show_help_fnf)
+        self.ui.show_contributors.triggered.connect(self.show_contributors_window)
+
+        # Advanced menu actions
+        self.variable_delay_action.toggled.connect(self.on_variable_delay_toggled)
+        self.fnf_idle_loop_action.toggled.connect(self.on_fnf_idle_loop_toggled)
+
+        # Note: Most UI element connections are now handled within the extract_tab_widget
+        # Initial UI state update
+        if hasattr(self, "extract_tab_widget"):
+            self.extract_tab_widget.update_ui_state()
+
+    def show_language_selection(self):
+        """Show the language selection window."""
         try:
-            current_os = platform.system()
-            assets_path = Utilities.find_root('assets')
-            if current_os == "Windows":
-                if assets_path is None:
-                    raise FileNotFoundError("Could not find 'assets' folder in any parent directory.")
-                self.root.iconbitmap(os.path.join(assets_path, "assets", "icon.ico"))
-            else:
-                icon = tk.PhotoImage(file=os.path.join(assets_path, "assets", "icon.png"))
-                self.root.iconphoto(True, icon)
+            from gui.language_selection_window import show_language_selection
+
+            show_language_selection(self)
+        except Exception as e:
+            QMessageBox.warning(
+                self,
+                self.tr("Error"),
+                self.tr("Could not open language selection: {error}").format(error=str(e)),
+            )
+
+    def create_app_config_window(self):
+        """Creates the preferences/app config window."""
+        try:
+            dialog = AppConfigWindow(self, self.app_config)
+            dialog.exec()
+        except Exception as e:
+            QMessageBox.warning(
+                self,
+                self.tr("Warning"),
+                self.tr("Could not open preferences: {error}").format(error=str(e)),
+            )
+
+    def show_help_manual(self):
+        """Shows the main help window with application manual."""
+        try:
+            HelpWindow.create_main_help_window(self)
+        except Exception as e:
+            QMessageBox.warning(
+                self,
+                self.tr("Error"),
+                self.tr("Could not open help window: {error}").format(error=str(e)),
+            )
+
+    def show_help_fnf(self):
+        """Shows the FNF-specific help window."""
+        try:
+            HelpWindow.create_fnf_help_window(self)
+        except Exception as e:
+            QMessageBox.warning(
+                self,
+                self.tr("Error"),
+                self.tr("Could not open FNF help window: {error}").format(error=str(e)),
+            )
+
+    def show_contributors_window(self):
+        """Shows the contributors window."""
+        try:
+            ContributorsWindow.show_contributors(self)
+        except Exception as e:
+            QMessageBox.warning(
+                self,
+                self.tr("Error"),
+                self.tr("Could not open contributors window: {error}").format(error=str(e)),
+            )
+
+    def show_compression_settings(self):
+        """Shows the compression settings window for the current frame format."""
+        try:
+            current_format = self.ui.frame_format_combobox.currentText()
+            dialog = CompressionSettingsWindow(
+                parent=self,
+                settings_manager=self.settings_manager,
+                app_config=self.app_config,
+                current_format=current_format,
+            )
+            dialog.exec()
+        except Exception as e:
+            QMessageBox.warning(
+                self,
+                self.tr("Error"),
+                self.tr("Could not open compression settings window: {error}").format(error=str(e)),
+            )
+
+    def create_find_and_replace_window(self):
+        """Creates the Find and Replace window."""
+        try:
+            dialog = FindReplaceWindow(self.store_replace_rules, self.replace_rules, self)
+            dialog.exec()
+        except Exception as e:
+            QMessageBox.warning(
+                self,
+                self.tr("Warning"),
+                self.tr("Could not open find/replace window: {error}").format(error=str(e)),
+            )
+
+    def create_settings_window(self):
+        """Creates the settings overview window."""
+        try:
+            dialog = SettingsWindow(self, self.settings_manager)
+            dialog.exec()
+        except Exception as e:
+            QMessageBox.warning(
+                self,
+                self.tr("Warning"),
+                self.tr("Could not open settings window: {error}").format(error=str(e)),
+            )
+
+    def store_replace_rules(self, rules):
+        """Stores the replace rules from the Find and Replace window."""
+        self.replace_rules = rules
+
+    def fnf_import_settings(self):
+        """Imports settings from FNF character data file."""
+        # Start from the last used input directory for FNF files
+        start_directory = self.app_config.get_last_input_directory()
+
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            self.tr("Select FNF Character Data File"),
+            start_directory,
+            self.tr("JSON files (*.json);;All files (*.*)"),
+        )
+
+        if file_path:
+            try:
+                # Save the directory of the selected file for next time
+                import os
+
+                file_dir = os.path.dirname(file_path)
+                self.app_config.set_last_input_directory(file_dir)
+
+                # Use the existing FNF utilities
+                self.fnf_utilities.import_character_settings(file_path)
+                QMessageBox.information(
+                    self, self.tr("Success"), self.tr("FNF settings imported successfully!")
+                )
+            except Exception as e:
+                QMessageBox.warning(
+                    self,
+                    self.tr("Error"),
+                    self.tr("Failed to import FNF settings: {error}").format(error=str(e)),
+                )
+
+    def check_version(self, force=False):
+        """Checks for updates to the application."""
+        try:
+            update_checker = UpdateChecker(self.current_version)
+            update_available, latest_version, download_url = update_checker.check_for_updates(
+                self
+            )
+
+            if update_available:
+                update_checker.download_and_install_update(
+                    download_url=download_url,
+                    latest_version=latest_version,
+                    parent_window=self,
+                )
+            elif force and latest_version:
+                QMessageBox.information(
+                    self,
+                    self.tr("Up to Date"),
+                    self.tr("You are already running the latest version ({version}).").format(
+                        version=latest_version
+                    ),
+                )
+        except Exception as e:
+            if force:
+                QMessageBox.warning(
+                    self,
+                    self.tr("Update Check Failed"),
+                    self.tr("Could not check for updates: {error}").format(error=str(e)),
+                )
+
+    def _run_startup_update_check(self):
+        """Kick off the automatic update check shortly after launch."""
+        self.check_version()
+
+    def update_ui_state(self, *args):
+        """Updates the UI state based on current selections and settings."""
+        both_export_unchecked = not (
+            self.ui.animation_export_group.isChecked() or self.ui.frame_export_group.isChecked()
+        )
+        self.ui.start_process_button.setEnabled(not both_export_unchecked)
+
+        has_spritesheet_selected = self.ui.listbox_png.currentItem() is not None
+        self.ui.override_spritesheet_settings_button.setEnabled(has_spritesheet_selected)
+
+        has_animation_selected = self.ui.listbox_data.currentItem() is not None
+        self.ui.override_animation_settings_button.setEnabled(has_animation_selected)
+
+    def on_animation_format_change(self):
+        """Handles animation format selection changes."""
+        format_index = self.ui.animation_format_combobox.currentIndex()
+
+        # Update UI based on format capabilities (GIF is index 0)
+        if format_index == 0:  # GIF
+            self.ui.threshold_entry.setEnabled(True)
+            self.ui.threshold_label.setEnabled(True)
+        else:
+            self.ui.threshold_entry.setEnabled(False)
+            self.ui.threshold_label.setEnabled(False)
+
+    def on_frame_format_change(self):
+        """Handles frame format selection changes."""
+        # Update compression options based on format
+        # This will need to be implemented when compression widgets are added
+        pass
+
+    def on_variable_delay_toggled(self, checked):
+        """Handle the variable delay menu toggle."""
+        self.variable_delay = checked
+        # Update the app config if needed
+        if hasattr(self.app_config, "settings"):
+            self.app_config.settings["variable_delay"] = checked
+
+    def on_fnf_idle_loop_toggled(self, checked):
+        """Handle the FNF idle loop menu toggle."""
+        self.fnf_idle_loop = checked
+        # Update the app config if needed
+        if hasattr(self.app_config, "settings"):
+            self.app_config.settings["fnf_idle_loop"] = checked
+
+    def start_process(self):
+        """Prepares and starts the processing thread."""
+        # Use the extract tab widget's preparation method
+        is_ready, error_message, spritesheet_list = self.extract_tab_widget.prepare_for_extraction()
+
+        if not is_ready:
+            QMessageBox.warning(self, self.tr("Error"), error_message)
+            return
+
+        # Handle background detection for unknown spritesheets in main thread
+        from core.extractor import Extractor
+
+        # Create a temporary extractor instance with required arguments
+        temp_extractor = Extractor(
+            progress_callback=None,
+            current_version=self.current_version,
+            settings_manager=self.settings_manager,
+        )
+        input_dir = self.extract_tab_widget.get_input_directory()
+        if temp_extractor._handle_unknown_spritesheets_background_detection(
+            input_dir, spritesheet_list, self
+        ):
+            # User cancelled background detection
+            return
+
+        # Create and show processing window
+        self.processing_window = ProcessingWindow(self)
+        self.processing_window.start_processing(len(spritesheet_list))
+        self.processing_window.show()
+        self.processing_window.raise_()  # Bring to front
+        self.processing_window.activateWindow()  # Make it active
+
+        # Set processing state
+        self.extract_tab_widget.set_processing_state(True)
+
+        # Start extraction in worker thread
+        self.worker = ExtractorWorker(self, spritesheet_list)
+        self.worker.extraction_completed.connect(self.on_extraction_completed)
+        self.worker.extraction_failed.connect(self.on_extraction_failed)
+        self.worker.progress_updated.connect(self.on_progress_updated)
+        self.worker.statistics_updated.connect(self.on_statistics_updated)
+        self.worker.debug_message.connect(self.on_debug_message)
+        self.worker.error_occurred.connect(self.on_worker_error)
+        self.worker.question_needed.connect(self.on_worker_question)
+        self.worker.start()
+
+    def run_extractor_core(self, spritesheet_list, progress_signal):
+        """Core extraction logic (runs in worker thread)."""
+        try:
+            print(f"[run_extractor_core] Starting with {len(spritesheet_list)} files")
+
+            # Create progress callback that emits signals to update UI
+            def progress_callback(current, total, filename=""):
+                print(f"[progress_callback] {current}/{total} - {filename}")
+                progress_signal(current, total, filename)
+
+            # Create statistics callback to track generation statistics
+            def statistics_callback(frames_generated, animations_generated, sprites_failed):
+                print(
+                    f"[statistics_callback] F:{frames_generated}, A:{animations_generated}, S:{sprites_failed}"
+                )
+                if hasattr(self, "worker") and self.worker:
+                    print(
+                        f"[statistics_callback] Emitting to worker: F:{frames_generated}, A:{animations_generated}, S:{sprites_failed}"
+                    )
+                    self.worker.emit_statistics(
+                        frames_generated, animations_generated, sprites_failed
+                    )
+                else:
+                    print("[statistics_callback] No worker available to emit statistics")
+
+            # Create debug callback to send processing log updates
+            def debug_callback(message):
+                print(f"[debug_callback] {message}")
+                # Emit debug message through a new signal
+                if hasattr(self.worker, "debug_message"):
+                    self.worker.debug_message.emit(message)
+
+            # Create extractor instance
+            extractor = Extractor(
+                progress_callback,
+                self.current_version,
+                self.settings_manager,
+                app_config=self.app_config,
+                statistics_callback=statistics_callback,
+            )
+
+            # Set additional callbacks
+            extractor.debug_callback = debug_callback
+            extractor.fnf_idle_loop = self.fnf_idle_loop
+
+            # Run extraction
+            input_dir = self.ui.input_dir_label.text()
+            output_dir = self.ui.output_dir_label.text()
+
+            print(f"[run_extractor_core] Input: {input_dir}, Output: {output_dir}")
+
+            extractor.process_directory(
+                input_dir,
+                output_dir,
+                parent_window=self,
+                spritesheet_list=spritesheet_list,
+            )
+
+            return "Extraction completed successfully!"
+
+        except Exception as e:
+            print(f"[run_extractor_core] Error: {str(e)}")
+            raise e
+
+    def on_extraction_completed(self, completion_message):
+        """Called when extraction completes successfully."""
+        print(f"[on_extraction_completed] {completion_message}")
+        self.extract_tab_widget.set_processing_state(False)
+
+        if hasattr(self, "processing_window"):
+            self.processing_window.processing_completed(True, completion_message)
+
+    def on_extraction_failed(self, error_message):
+        """Called when extraction fails."""
+        print(f"[on_extraction_failed] {error_message}")
+        self.extract_tab_widget.set_processing_state(False)
+
+        if hasattr(self, "processing_window"):
+            self.processing_window.processing_completed(False, error_message)
+
+    def on_progress_updated(self, current, total, filename):
+        """Updates the processing window with progress information."""
+        print(f"[on_progress_updated] {current}/{total} - {filename}")
+        if hasattr(self, "processing_window") and self.processing_window:
+            self.processing_window.update_progress(current, total, filename)
+        else:
+            print("[on_progress_updated] No processing window available")
+
+    def on_statistics_updated(self, frames_generated, animations_generated, sprites_failed):
+        """Updates the processing window with statistics information."""
+        print(
+            f"[on_statistics_updated] F:{frames_generated}, A:{animations_generated}, S:{sprites_failed}"
+        )
+        if hasattr(self, "processing_window") and self.processing_window:
+            self.processing_window.update_statistics(
+                frames_generated, animations_generated, sprites_failed
+            )
+        else:
+            print("[on_statistics_updated] No processing window available")
+
+    def on_debug_message(self, message):
+        """Handle debug messages from worker thread."""
+        print(f"[on_debug_message] {message}")
+        if hasattr(self, "processing_window") and self.processing_window:
+            self.processing_window.add_debug_message(message)
+        else:
+            print("[on_debug_message] No processing window available")
+
+    def on_worker_error(self, title, message):
+        """Handle error messages from worker thread."""
+        QMessageBox.critical(self, title, message)
+
+    def on_worker_question(self, title, message):
+        """Handle question dialogs from worker thread."""
+        reply = QMessageBox.question(
+            self, title, message, QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        # Send the response back to the worker
+        if hasattr(self, "worker"):
+            self.worker.continue_on_error = reply == QMessageBox.StandardButton.Yes
+
+    def closeEvent(self, event):
+        """Handles the window close event."""
+        # Clean up temporary files
+        try:
+            shutil.rmtree(self.temp_dir, ignore_errors=True)
+            # Clean up manual selection temp directory
+            if self.manual_selection_temp_dir:
+                shutil.rmtree(self.manual_selection_temp_dir, ignore_errors=True)
         except Exception:
             pass
 
-        self.menubar = tk.Menu(self.root)
-        self.root.config(menu=self.menubar)
-
-        self.setup_menus()
-        self.setup_widgets()
-
-    def setup_menus(self):
-        defaults = self.app_config.get_extraction_defaults() if hasattr(self.app_config, 'get_extraction_defaults') else {}
-
-        file_menu = tk.Menu(self.menubar, tearoff=0)
-        file_menu.add_command(label="Select directory", command=lambda: self.select_directory(self.input_dir, self.input_dir_label) 
-            and self.settings_manager.animation_settings.clear()
-            and self.settings_manager.spritesheet_settings.clear()
-        )
-        file_menu.add_command(label="Select files", command=lambda: self.select_files_manually(self.input_dir, self.input_dir_label))
-        file_menu.add_command(label="Clear filelist and user settings", command=self.clear_filelist)
-        file_menu.add_separator()
-        file_menu.add_command(label="Exit", command=self.on_closing)
-        self.menubar.add_cascade(label="File", menu=file_menu)
-
-        import_menu = tk.Menu(self.menubar, tearoff=0)
-        import_menu.add_command(label="FNF: Import settings from character data file", command=lambda: self.fnf_utilities.fnf_select_char_data_directory(self.settings_manager, self.data_dict, self.listbox_png, self.listbox_data))
-        self.menubar.add_cascade(label="Import", menu=import_menu)
-
-        help_menu = tk.Menu(self.menubar, tearoff=0)
-        help_menu.add_command(label="Manual", command=HelpWindow.create_main_help_window)
-        help_menu.add_separator()
-        help_menu.add_command(label="FNF: GIF/WebP settings advice", command=HelpWindow.create_fnf_help_window)
-        self.menubar.add_cascade(label="Help", menu=help_menu)
-
-        advanced_menu = tk.Menu(self.menubar, tearoff=0)
-        self.variable_delay = tk.BooleanVar(value=defaults.get("variable_delay"))
-        self.fnf_idle_loop = tk.BooleanVar(value=defaults.get("fnf_idle_loop"))
-        advanced_menu.add_checkbutton(label="Variable delay", variable=self.variable_delay)
-        advanced_menu.add_checkbutton(label="FNF: Set loop delay on idle animations to 0", variable=self.fnf_idle_loop)
-        self.menubar.add_cascade(label="Advanced", menu=advanced_menu)
-
-        options_menu = tk.Menu(self.menubar, tearoff=0)
-        options_menu.add_command(label="Preferences", command=self.create_app_config_window)
-        self.menubar.add_cascade(label="Options", menu=options_menu)
-
-    def setup_widgets(self):
-        defaults = self.app_config.get_extraction_defaults() if hasattr(self.app_config, 'get_extraction_defaults') else {}
-        self.progress_var = tk.DoubleVar()
-        self.progress_bar = ttk.Progressbar(self.root, length=865, variable=self.progress_var)
-        self.progress_bar.pack(pady=8)
-
-        self.scrollbar_png = tk.Scrollbar(self.root)
-        self.scrollbar_png.pack(side=tk.LEFT, fill=tk.Y)
-
-        self.listbox_png = tk.Listbox(self.root, width=30, exportselection=0, yscrollcommand=self.scrollbar_png.set)
-        self.listbox_png.pack(side=tk.LEFT, fill=tk.Y)
-
-        self.scrollbar_xml = tk.Scrollbar(self.root)
-        self.scrollbar_xml.pack(side=tk.LEFT, fill=tk.Y)
-
-        self.listbox_data = tk.Listbox(self.root, width=30, yscrollcommand=self.scrollbar_xml.set)
-        self.listbox_data.pack(side=tk.LEFT, fill=tk.Y)
-
-        self.scrollbar_png.config(command=self.listbox_png.yview)
-        self.scrollbar_xml.config(command=self.listbox_data.yview)
-        
-        self.listbox_png_menu = tk.Menu(self.root, tearoff=0)
-        self.listbox_png_menu.add_command(label="Delete", command=self.delete_selected_spritesheet)
-        self.listbox_png.bind("<Button-3>", self.show_listbox_png_menu)
-    
-        self.input_dir = tk.StringVar()
-        self.input_button = tk.Button(self.root, text="Select directory with spritesheets", cursor="hand2",
-            command=lambda: self.select_directory(self.input_dir, self.input_dir_label) 
-            and self.settings_manager.animation_settings.clear()
-            and self.settings_manager.spritesheet_settings.clear()
-        )
-        self.input_button.pack(pady=2)
-
-        self.input_dir_label = tk.Label(self.root, text="No input directory selected")
-        self.input_dir_label.pack(pady=2)
-
-        self.output_dir = tk.StringVar()
-        self.output_button = tk.Button(self.root, text="Select save directory", cursor="hand2", command=lambda: self.select_directory(self.output_dir, self.output_dir_label))
-        self.output_button.pack(pady=2)
-
-        self.output_dir_label = tk.Label(self.root, text="No output directory selected")
-        self.output_dir_label.pack(pady=2)
-        
-        ttk.Separator(root, orient="horizontal").pack(fill="x", pady=2)
-
-        self.animation_format = tk.StringVar(value=defaults.get("animation_format"))
-        self.animation_format_label = tk.Label(self.root, text="Animation format:")
-        self.animation_format_label.pack()
-        self.animation_format_combobox = ttk.Combobox(
-            self.root,
-            textvariable=self.animation_format,
-            values=["None", "GIF", "WebP", "APNG"],
-            state="readonly"
-        )
-        self.animation_format_combobox.pack()
-
-        self.set_framerate = tk.DoubleVar(value=defaults.get("fps"))
-        self.frame_rate_label = tk.Label(self.root, text="Frame rate (fps):")
-        self.frame_rate_label.pack()
-        self.frame_rate_entry = tk.Entry(self.root, textvariable=self.set_framerate)
-        self.frame_rate_entry.pack()
-
-        self.set_loopdelay = tk.DoubleVar(value=defaults.get("delay"))
-        self.loopdelay_label = tk.Label(self.root, text="Loop delay (ms):")
-        self.loopdelay_label.pack()
-        self.loopdelay_entry = tk.Entry(self.root, textvariable=self.set_loopdelay)
-        self.loopdelay_entry.pack()
-
-        self.set_minperiod = tk.DoubleVar(value=defaults.get("period"))
-        self.minperiod_label = tk.Label(self.root, text="Minimum period (ms):")
-        self.minperiod_label.pack()
-        self.minperiod_entry = tk.Entry(self.root, textvariable=self.set_minperiod)
-        self.minperiod_entry.pack()
-
-        self.set_scale = tk.DoubleVar(value=defaults.get("scale"))
-        self.scale_label = tk.Label(self.root, text="Scale:")
-        self.scale_label.pack()
-        self.scale_entry = tk.Entry(self.root, textvariable=self.set_scale)
-        self.scale_entry.pack()
-
-        self.set_threshold = tk.DoubleVar(value=defaults.get("threshold"))
-        self.threshold_label = tk.Label(self.root, text="Alpha threshold:")
-        self.threshold_label.pack()
-        self.threshold_entry = tk.Entry(self.root, textvariable=self.set_threshold)
-        self.threshold_entry.pack(pady=4)
-
-        ttk.Separator(root, orient="horizontal").pack(fill="x", pady=2)
-
-        self.keep_frames = tk.StringVar(value=defaults.get("keep_frames"))
-        self.keepframes_label = tk.Label(self.root, text="Keep individual frames:")
-        self.keepframes_label.pack()
-        self.keepframes_menu = ttk.Combobox(self.root, textvariable=self.keep_frames)
-        self.keepframes_menu['values'] = ("None", "All", "No duplicates", "First", "Last", "First, Last")
-        self.keepframes_menu.pack(pady=2)
-
-        self.crop_option = tk.StringVar(value=defaults.get("crop_option"))
-        self.crop_menu_label = tk.Label(self.root, text="Cropping method:")
-        self.crop_menu_label.pack()
-        self.crop_menu_menu = ttk.Combobox(self.root, textvariable=self.crop_option, state="readonly")
-        self.crop_menu_menu['values'] = ("None", "Animation based", "Frame based")
-        self.crop_menu_menu.pack(pady=2)
-
-        self.prefix_label = tk.Label(self.root, text="Filename prefix:")
-        self.prefix_label.pack()
-        self.prefix = tk.StringVar(value="")
-        self.prefix_entry = tk.Entry(self.root, textvariable=self.prefix)
-        self.prefix_entry.pack()
-
-        self.filename_format = tk.StringVar(value=defaults.get("filename_format"))
-        self.filename_format_label = tk.Label(self.root, text="Filename format:")
-        self.filename_format_label.pack()
-        self.filename_format_menu = ttk.Combobox(self.root, textvariable=self.filename_format)
-        self.filename_format_menu['values'] = ("Standardized", "No spaces", "No special characters")
-        self.filename_format_menu.pack(pady=2)
-        # "Standardized" example: "GodsentGaslit - Catnap - Idle"
-        # "No Spaces" example: "GodsentGaslit-Catnap-Idle"
-        # "No Special Characters" example: "GodsentGaslitCatnapIdle"
-        self.replace_rules = []
-        self.replace_button = tk.Button(self.root, text="Find and replace", cursor="hand2", command=lambda: self.create_find_and_replace_window())
-        self.replace_button.pack(pady=2)
-        
-        self.button_frame = tk.Frame(self.root)
-        self.button_frame.pack(pady=8)
-
-        self.show_user_settings = tk.Button(self.button_frame, text="Show user settings", command=self.create_settings_window)
-        self.show_user_settings.pack(side=tk.LEFT, padx=4)
-
-        self.process_button = tk.Button(self.button_frame, text="Start process", cursor="hand2", command=lambda: self.start_process())
-        self.process_button.pack(side=tk.LEFT, padx=2)
-
-        self.author_label = tk.Label(self.root, text="Project started by AutisticLulu")
-        self.author_label.pack(side='bottom')
-
-        self.linkSourceCode = "https://github.com/MeguminBOT/TextureAtlas-to-GIF-and-Frames"
-        self.link1 = tk.Label(self.root, text="If you wish to contribute to the project, click here!", fg="blue", cursor="hand2")
-        self.link1.pack(side='bottom')
-        self.link1.bind("<Button-1>", lambda e: self.contributeLink(self.linkSourceCode))
-
-    def contributeLink(self, linkSourceCode):
-        webbrowser.open_new(linkSourceCode)
-        
-    def check_version(self, force=False):
-        update_settings = self.app_config.get("update_settings", {})
-        check_on_startup = update_settings.get("check_updates_on_startup", False)
-        auto_update = update_settings.get("auto_download_updates", False)
-        if force or check_on_startup:
-            UpdateChecker.check_for_updates(self.current_version, auto_update=auto_update, parent_window=self.root)
-
-    def check_dependencies(self):
-        DependenciesChecker.check_and_configure_imagemagick()
-        
-    def create_app_config_window(self):
-        AppConfigWindow(self.root, self.app_config)
-
-    def clear_filelist(self):
-        self.listbox_png.delete(0, tk.END)
-        self.listbox_data.delete(0, tk.END)
-        self.settings_manager.animation_settings.clear()  # Clear animation-specific settings
-        self.settings_manager.spritesheet_settings.clear()  # Clear spritesheet-specific settings
-
-    def select_directory(self, variable, label):
-        directory = filedialog.askdirectory()
-        if directory:
-            variable.set(directory)
-            label.config(text=directory)
-            if variable == self.input_dir:
-                self.clear_filelist()
-                for filename in os.listdir(directory):
-                    if filename.endswith('.xml') or filename.endswith('.txt'):
-                        self.listbox_png.insert(tk.END, os.path.splitext(filename)[0] + '.png')
-                self.listbox_png.bind('<<ListboxSelect>>', self.on_select_spritesheet)
-                self.listbox_png.bind('<Double-1>', self.on_double_click_spritesheet)
-                self.listbox_data.bind('<Double-1>', self.on_double_click_animation)
-        return directory
-
-    def select_files_manually(self, variable, label):
-        data_files = filedialog.askopenfilenames(filetypes=[("XML and TXT files", "*.xml *.txt")])
-        png_files = filedialog.askopenfilenames(filetypes=[("PNG files", "*.png")])
-        variable.set(self.temp_dir)
-        label.config(text=self.temp_dir)
-        if data_files and png_files:
-            for file in data_files:
-                shutil.copy(file, self.temp_dir)
-                png_filename = os.path.splitext(os.path.basename(file))[0] + '.png'
-                if any(png_filename == os.path.basename(png) for png in png_files):
-                    if png_filename not in [self.listbox_png.get(idx) for idx in range(self.listbox_png.size())]:
-                        self.listbox_png.insert(tk.END, png_filename)
-                        self.data_dict[png_filename] = os.path.basename(file)
-            for file in png_files:
-                shutil.copy(file, self.temp_dir)
-            self.listbox_png.unbind('<<ListboxSelect>>')
-            self.listbox_data.unbind('<Double-1>')
-            self.listbox_png.bind('<<ListboxSelect>>', self.on_select_spritesheet)
-            self.listbox_data.bind('<Double-1>', self.on_double_click_animation)
-        return self.temp_dir
-
-    def create_settings_window(self):
-        SettingsWindow(self.root, self.settings_manager)
-
-    def create_find_and_replace_window(self):
-        FindReplaceWindow(self.root, self.replace_rules, self.store_replace_rules)
-
-    def store_replace_rules(self, rules):
-        self.replace_rules = rules
-
-    def create_override_settings_window(self, window, name, settings_type):
-        self.update_global_settings()
-        OverrideSettingsWindow(window, name, settings_type, self.settings_manager, self.store_input, app=self)
-
-    def on_select_spritesheet(self, evt):
-        self.listbox_data.delete(0, tk.END)
-
-        png_filename = self.listbox_png.get(self.listbox_png.curselection())
-        base_filename = os.path.splitext(png_filename)[0]
-        xml_filename = base_filename + '.xml'
-        txt_filename = base_filename + '.txt'
-
-        directory = self.input_dir.get()
-
-        if os.path.isfile(os.path.join(directory, xml_filename)):
-            xml_parser = XmlParser(directory, xml_filename, self.listbox_data)
-            xml_parser.get_data()
-        elif os.path.isfile(os.path.join(directory, txt_filename)):
-            txt_parser = TxtParser(directory, txt_filename, self.listbox_data)
-            txt_parser.get_data()
-
-    def on_double_click_spritesheet(self, evt):
-        spritesheet_name = self.listbox_png.get(self.listbox_png.curselection())
-        new_window = tk.Toplevel()
-        new_window.geometry("360x360")
-        self.create_override_settings_window(new_window, spritesheet_name, "spritesheet")
-
-    def on_double_click_animation(self, evt):
-        spritesheet_name = self.listbox_png.get(self.listbox_png.curselection())
-        animation_name = self.listbox_data.get(self.listbox_data.curselection())
-        full_anim_name = spritesheet_name + '/' + animation_name
-        new_window = tk.Toplevel()
-        new_window.geometry("360x400")
-        self.create_override_settings_window(new_window, full_anim_name, "animation")
-        
-    def show_listbox_png_menu(self, event):
+        # Save settings if needed
         try:
-            index = self.listbox_png.nearest(event.y)
-            self.listbox_png.selection_clear(0, tk.END)
-            self.listbox_png.selection_set(index)
-            self.listbox_png.activate(index)
-            self.listbox_png_menu.tk_popup(event.x_root, event.y_root)
-        finally:
-            self.listbox_png_menu.grab_release()
+            self.app_config.save_settings()
+        except Exception:
+            pass
 
-    def delete_selected_spritesheet(self):
-        selection = self.listbox_png.curselection()
-        if selection:
-            spritesheet_name = self.listbox_png.get(selection[0])
-            self.listbox_png.delete(selection[0])
-            self.listbox_data.delete(0, tk.END)
+        event.accept()
 
-            keys = list(self.data_dict.keys())
-            if selection[0] < len(keys):
-                del self.data_dict[keys[selection[0]]]
+    def change_language(self, language_code):
+        """Change the application language and refresh the UI."""
+        try:
+            # Check if machine translation disclaimer should be shown
+            if hasattr(self, "translation_manager"):
+                # Get language display name
+                available_languages = self.translation_manager.get_available_languages()
+                language_name = available_languages.get(language_code, {}).get(
+                    "name", language_code
+                )
 
-            self.settings_manager.delete_spritesheet_settings(spritesheet_name)
-            #print(f"Removed: {spritesheet_name}")
+                # Show machine translation disclaimer if needed
+                if not MachineTranslationDisclaimerDialog.show_machine_translation_disclaimer(
+                    self, self.translation_manager, language_code, language_name
+                ):
+                    # User cancelled the language change
+                    return
 
-            prefix = spritesheet_name + "/"
-            anims_to_delete = [key for key in self.settings_manager.animation_settings if key.startswith(prefix)]
-            for anim in anims_to_delete:
-                self.settings_manager.delete_animation_settings(anim)
+            # Update the config
+            self.app_config.set_language(language_code)
 
-    def preview_gif_window(self, name, settings_type, fps_entry, delay_entry, period_entry, scale_entry, threshold_entry, indices_entry, frames_entry):
-        GifPreviewWindow.preview(
-            self, name, settings_type, fps_entry, delay_entry, period_entry, scale_entry, threshold_entry, indices_entry, frames_entry
+            # Load the new translation
+            if hasattr(self, "translation_manager"):
+                success = self.translation_manager.load_translation(language_code)
+                if success:
+                    # Refresh the UI with new translations
+                    self.translation_manager.refresh_ui(self)
+
+                    # Retranslate all UI elements
+                    self.ui.retranslateUi(self)
+
+                    # Show success message (in the new language)
+                    from PySide6.QtCore import QCoreApplication
+
+                    success_msg = QCoreApplication.translate(
+                        "TextureAtlasExtractorApp", "Language changed successfully!"
+                    )
+                    QMessageBox.information(self, "Success", success_msg)
+                else:
+                    # Show error message
+                    QMessageBox.warning(
+                        self,
+                        self.tr("Error"),
+                        self.tr("Could not load language '{language}'").format(
+                            language=language_code
+                        ),
+                    )
+
+        except Exception as e:
+            QMessageBox.warning(
+                self,
+                self.tr("Error"),
+                self.tr("Failed to change language: {error}").format(error=str(e)),
+            )
+
+    def get_available_languages(self):
+        """Get list of available languages for the language selector."""
+        if hasattr(self, "translation_manager"):
+            return self.translation_manager.get_available_languages()
+        return {"en": "English"}
+
+    def get_complete_preview_settings(self, spritesheet_name, animation_name):
+        """Get complete settings for preview, merging global, spritesheet, and animation overrides."""
+        # Update global settings through the extract tab widget
+        if hasattr(self, "extract_tab_widget") and self.extract_tab_widget:
+            self.extract_tab_widget.update_global_settings()
+
+        full_animation_name = f"{spritesheet_name}/{animation_name}"
+
+        # Get merged settings using the settings manager
+        complete_settings = self.settings_manager.get_settings(
+            spritesheet_name, full_animation_name
         )
 
-    def show_gif_preview_window(self, gif_path, settings):
-        GifPreviewWindow.show(gif_path, settings)
-
-    def store_input(self, window, name, settings_type, fps_entry, delay_entry, period_entry, scale_entry, threshold_entry, indices_entry, frames_entry, filename_entry):
-        settings = {}
-        try:
-            if fps_entry.get() != '':
-                settings['fps'] = float(fps_entry.get())
-            if delay_entry.get() != '':
-                settings['delay'] = int(float(delay_entry.get()))
-            if period_entry.get() != '':
-                settings['period'] = int(float(period_entry.get()))
-            if scale_entry.get() != '':
-                if float(scale_entry.get()) == 0:
-                    raise ValueError
-                settings['scale'] = float(scale_entry.get())
-            if threshold_entry.get() != '':
-                settings['threshold'] = min(max(float(threshold_entry.get()), 0), 1)
-            if indices_entry.get() != '':
-                indices = [int(ele) for ele in indices_entry.get().split(',')]
-                settings['indices'] = indices
-            if frames_entry.get() != '':
-                settings['frames'] = frames_entry.get()
-            if filename_entry and filename_entry.get() != '':
-                settings['filename'] = filename_entry.get()
-        except ValueError as e:
-            messagebox.showerror("Invalid input", f"Error: {str(e)}")
-            window.lift()
-            return
-
-        settings_method_map = {
-            "animation": self.settings_manager.set_animation_settings,
-            "spritesheet": self.settings_manager.set_spritesheet_settings,
+        # For preview, force certain settings to ensure good preview experience
+        preview_overrides = {
+            "frame_selection": "All",  # Always show all frames in preview
+            "crop_option": "None",  # No cropping for preview to see full frames
+            "animation_export": True,  # Always export animation for preview
         }
 
-        settings_method = settings_method_map.get(settings_type)
-        if settings_method:
-            settings_method(name, **settings)
+        complete_settings.update(preview_overrides)
 
-        window.destroy()
-        
-    def update_global_settings(self):
-        self.settings_manager.set_global_settings(
-            animation_format=self.animation_format.get(),
-            fps=self.set_framerate.get(),
-            delay=self.set_loopdelay.get(),
-            period=self.set_minperiod.get(),
-            scale=self.set_scale.get(),
-            threshold=self.set_threshold.get(),
-            frames=self.keep_frames.get(),
-            crop_option=self.crop_option.get(),
-            prefix=self.prefix.get(),
-            filename_format=self.filename_format.get(),
-            replace_rules=self.replace_rules,
-            var_delay=self.variable_delay.get(),
-            fnf_idle_loop=self.fnf_idle_loop.get(),
-        )
-        print("Global settings updated:", self.settings_manager.global_settings)
-        
-    def on_closing(self):
-        if self.temp_dir and os.path.exists(self.temp_dir):
-            shutil.rmtree(self.temp_dir)
-        self.root.destroy()
-        
-    def start_process(self):
-        self.update_global_settings()
+        return complete_settings
 
-        if any(char in self.settings_manager.global_settings["prefix"] for char in r'\/:*?"<>|'):
-            messagebox.showerror("Invalid Prefix", "The prefix contains invalid characters.")
+    def show_animation_preview_window(self, animation_path, settings):
+        """Shows the animation preview window for the given animation file."""
+        try:
+            from gui.animation_preview_window import AnimationPreviewWindow
+
+            # Create and show the preview window
+            preview_window = AnimationPreviewWindow(self, animation_path, settings)
+
+            # Connect signal to handle saved settings
+            preview_window.settings_saved.connect(self.handle_preview_settings_saved)
+
+            preview_window.exec()
+        except Exception as e:
+            QMessageBox.warning(
+                self,
+                self.tr("Preview Error"),
+                self.tr("Could not open animation preview: {error}").format(error=str(e)),
+            )
+
+    def handle_preview_settings_saved(self, preview_settings):
+        """Handle settings saved from animation preview window"""
+        # Get current animation details from extract tab widget
+        if not hasattr(self, "extract_tab_widget") or not self.extract_tab_widget:
             return
 
-        process_thread = threading.Thread(target=self.run_extractor)
-        process_thread.start()
+        # Get the selected spritesheet and animation using extract tab widget methods
+        spritesheet_name = self.extract_tab_widget.get_selected_spritesheet()
+        animation_name = self.extract_tab_widget.get_selected_animation()
 
-    def run_extractor(self):
-        spritesheet_list = [self.listbox_png.get(i) for i in range(self.listbox_png.size())]
+        if not spritesheet_name or not animation_name:
+            return
 
-        extractor = Extractor(self.progress_bar, self.current_version, self.settings_manager, app_config=self.app_config)
-        extractor.process_directory(
-            self.input_dir.get(),
-            self.output_dir.get(),
-            self.progress_var,
-            self.root,
-            spritesheet_list=spritesheet_list
+        full_anim_name = "{spritesheet}/{animation}".format(
+            spritesheet=spritesheet_name, animation=animation_name
         )
 
+        # Save the preview settings using the settings manager
+        self.settings_manager.animation_settings[full_anim_name] = preview_settings
+
+        # Show confirmation message
+        QMessageBox.information(
+            self,
+            self.tr("Settings Saved"),
+            self.tr("Animation override settings have been saved for '{name}'.").format(
+                name=full_anim_name
+            ),
+        )
+
+    def preview_animation_with_paths(self, spritesheet_path, metadata_path, animation_name, spritemap_info=None, spritesheet_label=None):
+        """Preview an animation given the paths and animation name. Used by ExtractTabWidget."""
+        try:
+            # Generate temp animation for preview
+            from core.extractor import Extractor
+
+            extractor = Extractor(None, self.current_version, self.settings_manager)
+
+            # Get spritesheet name from path for settings lookup
+            spritesheet_name = spritesheet_label or os.path.basename(spritesheet_path)
+
+            # Get complete preview settings that include global, spritesheet, and animation overrides
+            preview_settings = self.get_complete_preview_settings(spritesheet_name, animation_name)
+
+            temp_path = extractor.generate_temp_animation_for_preview(
+                atlas_path=spritesheet_path,
+                metadata_path=metadata_path,
+                settings=preview_settings,
+                animation_name=animation_name,
+                spritemap_info=spritemap_info,
+                spritesheet_label=spritesheet_name,
+            )
+
+            if temp_path and os.path.exists(temp_path):
+                # Show animation preview
+                self.show_animation_preview_window(temp_path, preview_settings)
+            else:
+                from PySide6.QtWidgets import QMessageBox
+
+                QMessageBox.warning(
+                    self, self.tr("Preview Error"), self.tr("Could not generate animation preview.")
+                )
+
+        except Exception as e:
+            from PySide6.QtWidgets import QMessageBox
+
+            QMessageBox.warning(
+                self,
+                self.tr("Preview Error"),
+                self.tr("Failed to preview animation: {error}").format(error=str(e)),
+            )
+
+
+def main():
+    """Main entry point for the application."""
+    # Enable high DPI support
+    QApplication.setHighDpiScaleFactorRoundingPolicy(
+        Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+    )
+
+    app = QApplication(sys.argv)
+
+    # Set application properties
+    app.setApplicationName("TextureAtlas Toolbox")
+    app.setApplicationVersion("2.0.0")
+    app.setOrganizationName("AutisticLulu")
+
+    # Create and show the main window
+    window = TextureAtlasExtractorApp()
+    window.show()
+
+    # Start the event loop
+    sys.exit(app.exec())
+
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="TextureAtlas to GIF and Frames")
-    parser.add_argument("--update", action="store_true", help="Run in update mode")
-    parser.add_argument("--wait", type=int, default=3, help="Seconds to wait before starting update")
-    args = parser.parse_args()
-    
-    if args.update:
-        from utils.update_installer import Updater, UpdateUtilities
-        
-        print("Starting update process...")
-        if args.wait > 0:
-            print(f"Waiting {args.wait} seconds...")
-            import time
-            time.sleep(args.wait)
-        
-        exe_mode = UpdateUtilities.is_frozen()
-        updater = Updater(use_gui=True, exe_mode=exe_mode)
-        
-        if exe_mode:
-            print("Running executable update...")
-            updater.update_exe()
-        else:
-            print("Running source update...")
-            updater.update_source()
-        
-        if updater.use_gui and updater.console:
-            updater.console.window.mainloop()
-    else:
-        root = tk.Tk()
-        app = TextureAtlasExtractorApp(root)
-        root.mainloop()
+    main()

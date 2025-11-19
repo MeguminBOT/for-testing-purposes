@@ -1,193 +1,294 @@
-import os
 import platform
-import subprocess
-import sys
 import requests
 
-import tkinter as tk
-from tkinter import messagebox
+from PySide6.QtWidgets import (
+    QDialog,
+    QVBoxLayout,
+    QHBoxLayout,
+    QLabel,
+    QTextEdit,
+    QPushButton,
+    QMessageBox,
+)
+from PySide6.QtCore import Qt
 
-# Import our own modules
-from utils.utilities import Utilities
+
+class UpdateDialog(QDialog):
+    """
+    A custom dialog window for displaying update information with changelog.
+
+    Attributes:
+        result (bool): The user's choice (True for update, False for cancel)
+
+    Methods:
+        __init__(parent, current_version, latest_version, changelog, update_type):
+            Initialize the update dialog with version info and changelog
+        show_dialog():
+            Display the dialog and return the user's choice
+        _on_update():
+            Handle the update button click
+        _on_cancel():
+            Handle the cancel button click
+    """
+
+    def __init__(self, parent, current_version, latest_version, changelog, update_type):
+        super().__init__(parent)
+        self.result = False
+
+        self.setWindowTitle(self.tr("Update Available"))
+        self.setFixedSize(600, 500)
+        self.setModal(True)
+
+        # Center the dialog
+        if parent:
+            parent_rect = parent.geometry()
+            self.move(
+                parent_rect.x() + (parent_rect.width() - 600) // 2,
+                parent_rect.y() + (parent_rect.height() - 500) // 2,
+            )
+
+        self._create_widgets(current_version, latest_version, changelog, update_type)
+
+    def tr(self, text):
+        """Translation helper method."""
+        from PySide6.QtCore import QCoreApplication
+
+        return QCoreApplication.translate(self.__class__.__name__, text)
+
+    def _create_widgets(self, current_version, latest_version, changelog, update_type):
+        layout = QVBoxLayout(self)
+
+        # Header
+        if update_type == "major":
+            title_text = "🎉 Major Update Available! 🎉"
+            version_text = (
+                f"Version {latest_version} is now available!\n(You have version {current_version})"
+            )
+        elif update_type == "minor":
+            title_text = "✨ New Update Available! ✨"
+            version_text = (
+                f"Version {latest_version} is now available!\n(You have version {current_version})"
+            )
+        else:  # patch
+            title_text = "🔧 Bug Fix Update Available"
+            version_text = (
+                f"Version {latest_version} is now available!\n(You have version {current_version})"
+            )
+
+        title_label = QLabel(title_text)
+        title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title_label.setStyleSheet("font-size: 16px; font-weight: bold; margin: 10px;")
+        layout.addWidget(title_label)
+
+        version_label = QLabel(version_text)
+        version_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        version_label.setStyleSheet("font-size: 12px; margin-bottom: 15px;")
+        layout.addWidget(version_label)
+
+        # Changelog
+        changelog_label = QLabel("What's New:")
+        changelog_label.setStyleSheet("font-weight: bold; font-size: 14px;")
+        layout.addWidget(changelog_label)
+
+        self.changelog_text = QTextEdit()
+        self.changelog_text.setPlainText(changelog)
+        self.changelog_text.setReadOnly(True)
+        layout.addWidget(self.changelog_text)
+
+        # Buttons
+        button_layout = QHBoxLayout()
+
+        self.update_btn = QPushButton(self.tr("Update Now"))
+        self.update_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #4CAF50;
+                color: white;
+                border: none;
+                padding: 10px 20px;
+                font-size: 14px;
+                font-weight: bold;
+                border-radius: 5px;
+            }
+            QPushButton:hover {
+                background-color: #45a049;
+            }
+        """)
+        self.update_btn.clicked.connect(self._on_update)
+
+        self.cancel_btn = QPushButton(self.tr("Cancel"))
+        self.cancel_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #f44336;
+                color: white;
+                border: none;
+                padding: 10px 20px;
+                font-size: 14px;
+                border-radius: 5px;
+            }
+            QPushButton:hover {
+                background-color: #da190b;
+            }
+        """)
+        self.cancel_btn.clicked.connect(self._on_cancel)
+
+        button_layout.addWidget(self.update_btn)
+        button_layout.addWidget(self.cancel_btn)
+        layout.addLayout(button_layout)
+
+    def show_dialog(self):
+        """Display the dialog and return the user's choice."""
+        self.exec()
+        return self.result
+
+    def _on_update(self):
+        """Handle the update button click."""
+        self.result = True
+        self.accept()
+
+    def _on_cancel(self):
+        """Handle the cancel button click."""
+        self.result = False
+        self.reject()
+
 
 class UpdateChecker:
     """
-    A class for managing update checks and update installation for the application.
-
-    Attributes:
-        None
+    A class for checking and managing updates.
 
     Methods:
-        is_frozen():
-            Determine if the application is running as a frozen executable.
-        get_latest_release_info():
-            Retrieve the latest release information from GitHub.
-        check_for_updates(current_version, auto_update=False, parent_window=None):
-            Check for updates and optionally prompt or perform update.
-        _launch_standalone_updater(exe_mode=False):
-            Launch the standalone updater script and exit the current application.
+        check_for_updates():
+            Check if a new version is available.
+        get_current_version():
+            Get the current version from the app.
+        download_and_install_update(download_url, latest_version):
+            Download and install the latest version.
+        run_update_installer(installer_path, latest_version):
+            Run the update installer.
+        determine_update_type(current_version, latest_version):
+            Determine if the update is major, minor, or patch.
     """
 
-    @staticmethod
-    def is_frozen():
-        return getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS')
-    
-    @staticmethod
-    def get_latest_release_info():
-        url = "https://api.github.com/repos/MeguminBOT/for-testing-purposes/releases/3"
-        ## URL for quick testing and avoiding replacing critical dev files: https://api.github.com/repos/MeguminBOT/for-testing-purposes/releases/3
-        ## URL for actual releases: https://api.github.com/repos/MeguminBOT/TextureAtlas-to-GIF-and-Frames/releases/latest
-        response = requests.get(url)
-        response.raise_for_status()
-        return response.json()
+    def __init__(self, current_version):
+        self.current_version = current_version
 
-    @staticmethod
-    def check_for_updates(current_version, auto_update=False, parent_window=None):
+    def check_for_updates(self, parent_window=None):
+        """
+        Check if a new version is available and show update dialog if needed.
+
+        Args:
+            parent_window: Parent Qt window for the dialog
+
+        Returns:
+            tuple: (bool, str, str) - (update_available, latest_version, download_url)
+        """
         try:
-            print(f"Checking for updates... Current version: {current_version}")
+            api_url = "https://api.github.com/repos/MeguminBOT/TextureAtlas-to-GIF-and-Frames/releases/latest"
 
-            response = requests.get(
-                'https://raw.githubusercontent.com/MeguminBOT/TextureAtlas-to-GIF-and-Frames/main/latestVersion.txt',
-                timeout=10
-            )
+            response = requests.get(api_url, timeout=10)
             response.raise_for_status()
-            latest_version = response.text.strip()
 
-            print(f"Latest version available: {latest_version}")
+            release_data = response.json()
+            latest_version = release_data["tag_name"].lstrip("v")
+            changelog = release_data.get("body", "No changelog available.")
 
-            if latest_version > current_version:
-                print("Update available!")
+            if self._is_newer_version(latest_version, self.current_version):
+                update_type = self.determine_update_type(self.current_version, latest_version)
 
-                parent = parent_window if parent_window is not None else tk.Tk()
-                if parent_window is None:
-                    parent.withdraw()
-
-                if auto_update:
-                    print("Auto-update enabled, starting update process...")
-                    if UpdateChecker.is_frozen():
-                        if platform.system() != "Windows":
-                            print(f"Error: Executable updates are only supported on Windows. Current platform: {platform.system()}")
-                            print("Please use source code updates on macOS/Linux or manually download the release.")
-                            return
-                        print("Running as executable, using standalone updater")
-                        UpdateChecker._launch_standalone_updater(exe_mode=True)
-                    else:
-                        print("Running from source, using standalone updater")
-                        UpdateChecker._launch_standalone_updater(exe_mode=False)
-                else:
-                    update_type = "executable" if UpdateChecker.is_frozen() else "source code"
-                    message = (
-                        f"An update is available!\n\n"
-                        f"Current version: {current_version}\n"
-                        f"Latest version: {latest_version}\n\n"
-                        f"Update method: {update_type}\n\n"
-                        f"Do you want to download and install it now?\n"
-                        f"The application will restart after updating."
-                    )
-
-                    result = messagebox.askyesno(
-                        "Update Available", 
-                        message, 
-                        parent=parent
-                    )
-
-                    if result:
-                        print("User chose to update.")
-                        if UpdateChecker.is_frozen():
-                            if platform.system() != "Windows":
-                                error_msg = (
-                                    f"Executable updates are only supported on Windows.\n"
-                                    f"Current platform: {platform.system()}\n\n"
-                                    f"Please use source code updates on macOS/Linux or manually download the release."
-                                )
-                                messagebox.showerror("Platform Not Supported", error_msg, parent=parent)
-                                return
-                            print("Starting executable update...")
-                            UpdateChecker._launch_standalone_updater(exe_mode=True)
-                        else:
-                            print("Starting source update...")
-                            UpdateChecker._launch_standalone_updater(exe_mode=False)
-                    else:
-                        print("User chose not to update.")
-
-                if parent_window is None:
-                    parent.destroy()
-
+                # Show update dialog
+                dialog = UpdateDialog(
+                    parent_window, self.current_version, latest_version, changelog, update_type
+                )
+                if dialog.show_dialog():
+                    return True, latest_version, None
+                return False, latest_version, None
             else:
-                print("You are using the latest version of the application.")
+                return False, latest_version, None
 
-        except requests.exceptions.Timeout:
-            print("Update check timed out - no internet connection or server not responding")
-
-        except requests.exceptions.ConnectionError:
-            print("No internet connection available for update check")
-
-        except requests.exceptions.RequestException as err:
-            print(f"Network error during update check: {err}")
-
-        except Exception as err:
-            print(f"Unexpected error during update check: {err}")
-            import traceback
-            traceback.print_exc()    
-            
-    @staticmethod
-    def _launch_standalone_updater(exe_mode=False):
-        try:
-            if UpdateChecker.is_frozen() and exe_mode:
-                # When frozen, restart the same executable with --update flag
-                current_exe = sys.executable
-                cmd = [current_exe, "--update", "--wait", "3"]
-                
-                print(f"Restarting with update mode: {' '.join(cmd)}")
-                subprocess.Popen(cmd, cwd=os.path.dirname(current_exe))
-                
-                import time
-                time.sleep(1)
-
-                print("Exiting main application to allow update...")
-
-                try:
-                    import tkinter as tk
-                    root = tk._default_root
-                    if root:
-                        root.quit()
-                        root.destroy()
-                except:
-                    pass
-                
-                sys.exit(0)
-            else:
-                # When not frozen, run the updater script directly
-                project_root = Utilities.find_root('README.md')
-                if not project_root:
-                    raise Exception("Could not find project root")
-                
-                updater_script = os.path.join(project_root, "src", "utils", "update_installer.py")
-                if not os.path.exists(updater_script):
-                    raise Exception("Update installer script not found")
-                
-                cmd = [sys.executable, updater_script]
-                if exe_mode:
-                    cmd.append("--exe-mode")
-                
-                print(f"Launching updater: {' '.join(cmd)}")
-                subprocess.Popen(cmd, cwd=os.path.dirname(updater_script))
-                
-                import time
-                time.sleep(1)
-
-                print("Exiting main application to allow update...")
-
-                try:
-                    import tkinter as tk
-                    root = tk._default_root
-                    if root:
-                        root.quit()
-                        root.destroy()
-                except:
-                    pass
-                
-                sys.exit(0)
-                
+        except requests.RequestException as e:
+            QMessageBox.critical(
+                parent_window, "Update Check Failed", f"Failed to check for updates:\n{str(e)}"
+            )
+            return False, None, None
         except Exception as e:
-            print(f"Failed to launch standalone updater: {e}")
+            QMessageBox.critical(
+                parent_window,
+                "Update Error",
+                f"An error occurred while checking for updates:\n{str(e)}",
+            )
+            return False, None, None
+
+    def _is_newer_version(self, latest, current):
+        """Compare version strings to determine if latest is newer than current."""
+        try:
+
+            def version_tuple(version_str):
+                # Remove 'v' prefix if present and split by '.'
+                clean_version = version_str.lstrip("v")
+                return tuple(map(int, clean_version.split(".")))
+
+            return version_tuple(latest) > version_tuple(current)
+        except (ValueError, AttributeError):
+            return False
+
+    def determine_update_type(self, current_version, latest_version):
+        """
+        Determine the type of update (major, minor, patch) based on semantic versioning.
+
+        Args:
+            current_version (str): Current version string
+            latest_version (str): Latest version string
+
+        Returns:
+            str: Update type ('major', 'minor', or 'patch')
+        """
+        try:
+
+            def parse_version(version_str):
+                clean_version = version_str.lstrip("v")
+                parts = clean_version.split(".")
+                return [int(part) for part in parts[:3]]  # Take only major.minor.patch
+
+            current_parts = parse_version(current_version)
+            latest_parts = parse_version(latest_version)
+
+            # Pad with zeros if necessary
+            while len(current_parts) < 3:
+                current_parts.append(0)
+            while len(latest_parts) < 3:
+                latest_parts.append(0)
+
+            if latest_parts[0] > current_parts[0]:
+                return "major"
+            elif latest_parts[1] > current_parts[1]:
+                return "minor"
+            else:
+                return "patch"
+
+        except (ValueError, IndexError):
+            return "patch"  # Default to patch if version parsing fails
+
+    def download_and_install_update(self, download_url=None, latest_version=None, parent_window=None):
+        """
+        Download and install the update.
+
+        Args:
+            download_url (str): URL to download the update
+            latest_version (str): Version being downloaded
+            parent_window: Parent Qt window for dialogs
+        """
+        try:
+            from utils.update_installer import UpdateInstaller
+
+            installer = UpdateInstaller(parent_window)
+            installer.download_and_install(download_url, latest_version, parent_window)
+
+        except ImportError:
+            QMessageBox.critical(
+                parent_window,
+                "Update Error",
+                "Update installer not available. Please download the update manually.",
+            )
+        except Exception as e:
+            QMessageBox.critical(
+                parent_window, "Update Error", f"Failed to download and install update:\n{str(e)}"
+            )

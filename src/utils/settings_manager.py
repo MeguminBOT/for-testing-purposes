@@ -1,3 +1,6 @@
+import os
+
+
 class SettingsManager:
     """
     A class to manage global, spritesheet, and animation-specific settings.
@@ -37,7 +40,7 @@ class SettingsManager:
 
         if self.animation_settings[animation_name] == {}:
             del self.animation_settings[animation_name]
-        
+
     def delete_spritesheet_settings(self, spritesheet_name):
         if spritesheet_name in self.spritesheet_settings:
             del self.spritesheet_settings[spritesheet_name]
@@ -49,11 +52,21 @@ class SettingsManager:
     def get_settings(self, filename, animation_name=None):
         settings = self.global_settings.copy()
 
-        spritesheet_settings = self.spritesheet_settings.get(filename, {})
-        settings.update(spritesheet_settings)
+        spritesheet_settings = self.spritesheet_settings.get(filename)
+        if not spritesheet_settings:
+            basename = os.path.basename(filename)
+            if basename != filename:
+                spritesheet_settings = self.spritesheet_settings.get(basename)
+        settings.update(spritesheet_settings or {})
 
         if animation_name:
-            animation_settings = self.animation_settings.get(animation_name, {})
-            settings.update(animation_settings)
-        
+            animation_settings = self.animation_settings.get(animation_name)
+            if not animation_settings:
+                normalized = animation_name.replace("\\", "/")
+                if "/" in normalized:
+                    prefix, suffix = normalized.rsplit("/", 1)
+                    fallback_name = f"{os.path.basename(prefix)}/{suffix}"
+                    animation_settings = self.animation_settings.get(fallback_name)
+            settings.update(animation_settings or {})
+
         return settings
