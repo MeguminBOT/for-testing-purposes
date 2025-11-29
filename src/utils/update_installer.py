@@ -711,7 +711,9 @@ class Updater:
 
             self.set_progress(80, "Copying files...")
 
-            items_to_copy = [
+            # Dynamically discover what to copy from the source
+            # Core items that should always be copied if they exist
+            core_items = [
                 "assets",
                 "ImageMagick",
                 "src",
@@ -720,11 +722,38 @@ class Updater:
                 "README.md",
             ]
 
-            optional_items = [".gitignore", ".github", "docs", "setup"]
+            # Optional items that may or may not exist
+            optional_items = [".gitignore", ".github", "docs", "setup", "tests", "tools"]
+
+            # Items to skip (user/local data that shouldn't be overwritten)
+            skip_items = {"logs", "__pycache__", ".git", "config", "user_data", "cache", ".venv", "venv"}
+
+            # Build the list of items to copy based on what actually exists in source
+            items_to_copy = []
+
+            # Add core items that exist in source
+            for item in core_items:
+                if os.path.exists(os.path.join(source_project_root, item)):
+                    items_to_copy.append(item)
+                else:
+                    self.log(f"Core item '{item}' not found in source (may have been removed)", "warning")
+
+            # Add optional items that exist in source
             for item in optional_items:
                 if os.path.exists(os.path.join(source_project_root, item)):
                     items_to_copy.append(item)
                     self.log(f"Found optional item: {item}", "info")
+
+            # Also check for any other top-level items in source that we might have missed
+            for item in zipball_contents:
+                if item not in items_to_copy and item not in skip_items:
+                    src_path = os.path.join(source_project_root, item)
+                    # Only add files or directories that look like project files
+                    if os.path.isfile(src_path) or (os.path.isdir(src_path) and not item.startswith('.')):
+                        items_to_copy.append(item)
+                        self.log(f"Found additional item: {item}", "info")
+
+            self.log(f"Will update {len(items_to_copy)} items: {', '.join(items_to_copy)}", "info")
 
             for item in items_to_copy:
                 src_path = os.path.join(source_project_root, item)
@@ -1047,7 +1076,18 @@ class Updater:
                 self.ui.log(f"Executable update failed: {str(e)}", "error")
 
     def _merge_directory(self, src_dir, dst_dir):
-        """Recursively copy a tree from `src_dir` into `dst_dir`, overwriting file contents."""
+        """Recursively copy a tree from `src_dir` into `dst_dir`, overwriting file contents.
+
+        Also removes files in dst_dir that don't exist in src_dir (cleanup of old files),
+        but preserves user data directories like 'logs', 'config', etc.
+        """
+        # Directories that should never be deleted (user data)
+        preserved_dirs = {'logs', '__pycache__', '.git', 'config', 'user_data', 'cache'}
+        # File extensions that should never be deleted (user data)
+        preserved_extensions = {'.log', '.cfg', '.ini', '.user', '.local'}
+
+        # First, copy all files from source to destination
+        files_copied = 0
         for root, dirs, files in os.walk(src_dir):
             rel_path = os.path.relpath(root, src_dir)
             if rel_path == ".":
@@ -1061,6 +1101,44 @@ class Updater:
                 src_file = os.path.join(root, file)
                 dst_file = os.path.join(target_dir, file)
                 self._copy_file_with_retry(src_file, dst_file)
+                files_copied += 1
+
+        self.log(f"Copied {files_copied} files to {os.path.basename(dst_dir)}", "info")
+
+        # Then, remove files in destination that don't exist in source
+        # This cleans up old files that were removed in the new version
+        files_removed = 0
+        for root, dirs, files in os.walk(dst_dir):
+            rel_path = os.path.relpath(root, dst_dir)
+
+            # Skip preserved directories
+            if any(preserved in rel_path.split(os.sep) for preserved in preserved_dirs):
+                continue
+
+            for file in files:
+                # Skip preserved file types
+                if any(file.lower().endswith(ext) for ext in preserved_extensions):
+                    continue
+
+                dst_file = os.path.join(root, file)
+
+                # Determine the corresponding source path
+                if rel_path == ".":
+                    src_file = os.path.join(src_dir, file)
+                else:
+                    src_file = os.path.join(src_dir, rel_path, file)
+
+                # If file doesn't exist in source, it's obsolete - remove it
+                if not os.path.exists(src_file):
+                    try:
+                        os.remove(dst_file)
+                        files_removed += 1
+                        self.log(f"Removed obsolete file: {os.path.join(rel_path, file)}", "info")
+                    except Exception as e:
+                        self.log(f"Could not remove obsolete file {file}: {e}", "warning")
+
+        if files_removed > 0:
+            self.log(f"Cleaned up {files_removed} obsolete files", "info")
 
     def _copy_file_with_retry(self, src_file, dst_file, max_attempts=5):
         """Copy a file with retry/backoff logic, handling locked DLLs when necessary."""
