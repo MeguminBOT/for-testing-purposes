@@ -315,12 +315,6 @@ pytest tests/test_extractor.py
 pytest --cov=src tests/
 ```
 
-### Manual Updater UI Harness
-- Goal: visually inspect the PySide6 updater without reaching GitHub or modifying your installation.
-- Command: `python tools/manual_updater_ui.py`
-- Behavior: launches the real Qt dialog, but all network/filesystem calls are mocked so the download completes instantly against a fake release zip.
-- Notes: requires PySide6/PyQt to be installed; close the dialog manually once you've reviewed the logs and progress bar.
-
 ### Code Quality
 ```bash
 # Format code

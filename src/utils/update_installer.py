@@ -14,9 +14,22 @@ import threading
 from datetime import datetime
 import html
 import ctypes
+import json
+from pathlib import Path
+
+SRC_DIR = Path(__file__).resolve().parents[1]
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+from version import ( # noqa: E402
+    APP_VERSION,
+    GITHUB_LATEST_RELEASE_URL,
+    GITHUB_RELEASE_BY_TAG_URL,
+)
 
 try:
     import py7zr
+
     PY7ZR_AVAILABLE = True
 except ImportError:
     PY7ZR_AVAILABLE = False
@@ -33,7 +46,8 @@ try:
         QPushButton,
         QProgressBar,
     )
-    from PySide6.QtCore import Qt, QTimer, QThread
+    from PySide6.QtCore import Qt, Signal
+
     QT_AVAILABLE = True
 except ImportError:
     pass
@@ -49,6 +63,12 @@ if QT_AVAILABLE:
             "error": "#ff6b6b",
             "success": "#4caf50",
         }
+
+        # Custom signal for thread-safe logging
+        _log_signal = Signal(str, str)
+        _progress_signal = Signal(int, str)
+        _enable_restart_signal = Signal(object)
+        _allow_close_signal = Signal()
 
         def __init__(self, parent=None):
             super().__init__(parent)
@@ -96,13 +116,14 @@ if QT_AVAILABLE:
 
             self.restart_callback = None
 
-        def _run_on_ui(self, func, *args, **kwargs):
-            if QThread.currentThread() == self.thread():
-                func(*args, **kwargs)
-            else:
-                QTimer.singleShot(0, lambda: func(*args, **kwargs))
+            # Connect signals for thread-safe UI updates
+            self._log_signal.connect(self._do_log)
+            self._progress_signal.connect(self._do_progress)
+            self._enable_restart_signal.connect(self._do_enable_restart)
+            self._allow_close_signal.connect(self._do_allow_close)
 
-        def log(self, message, level="info"):
+        def _do_log(self, message, level):
+            """Actual log implementation, runs on UI thread."""
             color = self.LOG_COLORS.get(level, "#ffffff")
             timestamp = datetime.now().strftime("%H:%M:%S")
             safe_message = html.escape(message)
@@ -110,37 +131,43 @@ if QT_AVAILABLE:
                 f"<span style='color:#999999;'>[{timestamp}]</span> "
                 f"<span style='color:{color};'>{safe_message}</span>"
             )
+            self.log_view.append(formatted)
+            self.log_view.ensureCursorVisible()
 
-            def _append():
-                self.log_view.append(formatted)
-                self.log_view.ensureCursorVisible()
+        def _do_progress(self, value, status_text):
+            """Actual progress update, runs on UI thread."""
+            self.progress_bar.setValue(max(0, min(100, value)))
+            if status_text:
+                self.progress_label.setText(status_text)
 
-            self._run_on_ui(_append)
+        def _do_enable_restart(self, callback):
+            """Actual enable restart, runs on UI thread."""
+            self.restart_callback = callback
+            self.restart_button.setEnabled(True)
+
+        def _do_allow_close(self):
+            """Actual allow close, runs on UI thread."""
+            self.close_button.setEnabled(True)
+
+        def log(self, message, level="info"):
+            """Thread-safe logging via signal."""
+            self._log_signal.emit(message, level)
 
         def set_progress(self, value, status_text=""):
-            def _update():
-                self.progress_bar.setValue(max(0, min(100, value)))
-                if status_text:
-                    self.progress_label.setText(status_text)
-
-            self._run_on_ui(_update)
+            """Thread-safe progress update via signal."""
+            self._progress_signal.emit(value, status_text)
 
         def enable_restart(self, restart_callback):
-            def _enable():
-                self.restart_callback = restart_callback
-                self.restart_button.setEnabled(True)
-
-            self._run_on_ui(_enable)
+            """Thread-safe restart enable via signal."""
+            self._enable_restart_signal.emit(restart_callback)
 
         def allow_close(self):
-            self._run_on_ui(self.close_button.setEnabled, True)
+            """Thread-safe close enable via signal."""
+            self._allow_close_signal.emit()
 
         def _handle_restart(self):
             if callable(self.restart_callback):
                 self.restart_callback()
-
-        def close(self):
-            self._run_on_ui(super().close)
 
 
 class UpdateUtilities:
@@ -166,7 +193,7 @@ class UpdateUtilities:
         if not os.path.exists(file_path):
             return False
         try:
-            with open(file_path, 'r+b'):
+            with open(file_path, "r+b"):
                 pass
             return False
         except (IOError, OSError, PermissionError):
@@ -185,7 +212,7 @@ class UpdateUtilities:
     def extract_7z(archive_path, extract_dir):
         """Extract a .7z archive using py7zr if available, otherwise shell out to 7z."""
         if PY7ZR_AVAILABLE:
-            with py7zr.SevenZipFile(archive_path, mode='r') as archive:
+            with py7zr.SevenZipFile(archive_path, mode="r") as archive:
                 archive.extractall(path=extract_dir)
             return True
         else:
@@ -211,7 +238,7 @@ class UpdateUtilities:
         exe_files = []
         for item in os.listdir(directory):
             item_path = os.path.join(directory, item)
-            if os.path.isfile(item_path) and item.lower().endswith('.exe'):
+            if os.path.isfile(item_path) and item.lower().endswith(".exe"):
                 exe_files.append(item)
         return exe_files
 
@@ -262,15 +289,75 @@ class UpdateUtilities:
             print(f"Failed to request administrator privileges: {exc}")
             return False
 
+def _write_metadata_file(metadata):
+    """Persist release metadata to a temporary JSON file for external launcher."""
+    temp_dir = Path(tempfile.mkdtemp(prefix="tatgf_update_"))
+    metadata_path = temp_dir / "release_metadata.json"
+    with metadata_path.open("w", encoding="utf-8") as handle:
+        json.dump(metadata or {}, handle)
+    return metadata_path
+
+
+def launch_external_updater(
+    release_metadata=None,
+    latest_version=None,
+    exe_mode=False,
+    wait_seconds=3,
+):
+    """Spawn a fresh Python process to run the updater with optional metadata.
+
+    The updater runs as a completely separate process so it can replace
+    files after the main application exits.
+    """
+
+    script_path = Path(__file__).resolve()
+    project_root = script_path.parents[2]
+    args = [sys.executable, str(script_path)]
+
+    if wait_seconds is not None:
+        args.extend(["--wait", str(wait_seconds)])
+
+    if exe_mode:
+        args.append("--exe-mode")
+
+    if release_metadata:
+        metadata_path = _write_metadata_file(release_metadata)
+        args.extend(["--metadata-file", str(metadata_path)])
+
+    if latest_version:
+        args.extend(["--latest-version", latest_version])
+
+    print(f"Launching external updater: {' '.join(args)}")
+    print(f"Working directory: {project_root}")
+
+    # Use CREATE_NEW_PROCESS_GROUP on Windows for proper detachment
+    kwargs = {"cwd": str(project_root)}
+    if os.name == "nt":
+        # CREATE_NEW_PROCESS_GROUP = 0x00000200
+        # DETACHED_PROCESS = 0x00000008
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+
+    try:
+        process = subprocess.Popen(args, **kwargs)
+        print(f"Updater process started with PID: {process.pid}")
+        return True
+    except Exception as e:
+        print(f"Failed to launch updater: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
 
 class Updater:
     """Download and apply updates, optionally reporting progress through the Qt UI."""
 
-    def __init__(self, ui=None, exe_mode=False):
+    def __init__(self, ui=None, exe_mode=False, target_tag=None, release_metadata=None):
         """Initialize the updater and create a log file in the app directory when possible."""
         self.ui = ui
         self.exe_mode = exe_mode
         self.log_file = None
+        self.target_tag = target_tag
+        self.release_metadata = release_metadata or {}
         self._setup_log_file()
 
     def _setup_log_file(self):
@@ -321,16 +408,29 @@ class Updater:
             print("Update complete! Please restart the application manually.")
 
     @staticmethod
-    def get_latest_release_info():
-        """Fetch the latest GitHub release metadata and return the parsed JSON."""
-        url = "https://api.github.com/repos/MeguminBOT/TextureAtlas-to-GIF-and-Frames/releases/latest"
+    def get_latest_release_info(tag_name=None, fallback_metadata=None):
+        """Fetch release metadata for a tag or fall back to the latest release.
 
-        ### URLs for testing purposes:
-        # url = "https://api.github.com/repos/MeguminBOT/for-testing-purposes/releases/tags/tatgf-test-quick"
-        # url = "https://api.github.com/repos/MeguminBOT/for-testing-purposes/releases/tags/tatgf-test-source-update"
-        # url = "https://api.github.com/repos/MeguminBOT/for-testing-purposes/releases/tags/tatgf-test-executable-update"
+        If fallback_metadata already contains a zipball_url, it's used directly
+        to avoid an unnecessary network request.
+        """
+        # If we already have complete metadata with download URL, use it directly
+        if fallback_metadata and fallback_metadata.get("zipball_url"):
+            data = {"tag_name": tag_name or fallback_metadata.get("tag_name", "unknown")}
+            data.update(fallback_metadata)
+            return data
 
-        response = requests.get(url)
+        # Otherwise, try to fetch from GitHub
+        if tag_name:
+            response = requests.get(GITHUB_RELEASE_BY_TAG_URL.format(tag=tag_name), timeout=30)
+            if response.status_code == 404 and fallback_metadata:
+                data = {"tag_name": tag_name}
+                data.update(fallback_metadata)
+                return data
+            response.raise_for_status()
+            return response.json()
+
+        response = requests.get(GITHUB_LATEST_RELEASE_URL, timeout=30)
         response.raise_for_status()
         return response.json()
 
@@ -338,7 +438,7 @@ class Updater:
     def _detect_project_root(directory, exe_mode=False):
         """Check whether `directory` looks like a valid project root for the active mode."""
         if exe_mode:
-            required_folders = ['assets', 'ImageMagick']
+            required_folders = ["assets", "ImageMagick"]
             required_files = []
 
             for folder in required_folders:
@@ -353,8 +453,8 @@ class Updater:
             return True
         else:
             # For source mode, look for full project structure
-            required_folders = ['assets', 'ImageMagick', 'src']
-            required_files = ['latestVersion.txt', 'LICENSE', 'README.md']
+            required_folders = ["assets", "ImageMagick", "src"]
+            required_files = ["latestVersion.txt", "LICENSE", "README.md"]
 
             for folder in required_folders:
                 if not os.path.isdir(os.path.join(directory, folder)):
@@ -375,8 +475,10 @@ class Updater:
             potential_root = os.path.join(extract_dir, extracted_contents[0])
             if os.path.isdir(potential_root):
                 root_contents = os.listdir(potential_root)
-                project_indicators = ['src', 'README.md', 'assets', 'ImageMagick']
-                found_indicators = [item for item in project_indicators if item in root_contents]
+                project_indicators = ["src", "README.md", "assets", "ImageMagick"]
+                found_indicators = [
+                    item for item in project_indicators if item in root_contents
+                ]
 
                 if found_indicators:
                     return potential_root
@@ -397,7 +499,10 @@ class Updater:
         # For executable mode, wait longer since DLLs might need more time to be released
         if self.exe_mode:
             max_wait_seconds = 60
-            self.log("Executable mode detected, extending wait time for DLL release...", "info")
+            self.log(
+                "Executable mode detected, extending wait time for DLL release...",
+                "info",
+            )
 
         start_time = time.time()
         while time.time() - start_time < max_wait_seconds:
@@ -413,7 +518,7 @@ class Updater:
                 imagemagick_dir = os.path.join(app_root, "ImageMagick")
                 if os.path.exists(imagemagick_dir):
                     for dll_file in os.listdir(imagemagick_dir):
-                        if dll_file.lower().endswith('.dll'):
+                        if dll_file.lower().endswith(".dll"):
                             dll_path = os.path.join(imagemagick_dir, dll_file)
                             if UpdateUtilities.is_file_locked(dll_path):
                                 locked_files.append(dll_path)
@@ -422,7 +527,9 @@ class Updater:
                 project_root = self.find_project_root()
                 if project_root:
                     main_py = os.path.join(project_root, "src", "Main.py")
-                    if os.path.exists(main_py) and UpdateUtilities.is_file_locked(main_py):
+                    if os.path.exists(main_py) and UpdateUtilities.is_file_locked(
+                        main_py
+                    ):
                         locked_files.append(main_py)
 
             if not locked_files:
@@ -430,9 +537,15 @@ class Updater:
                 return True
             else:
                 if len(locked_files) <= 3:  # Only log a few files to avoid spam
-                    self.log(f"Still waiting for {len(locked_files)} files to be released: {', '.join([os.path.basename(f) for f in locked_files[:3]])}", "info")
+                    self.log(
+                        f"Still waiting for {len(locked_files)} files to be released: {', '.join([os.path.basename(f) for f in locked_files[:3]])}",
+                        "info",
+                    )
                 else:
-                    self.log(f"Still waiting for {len(locked_files)} files to be released...", "info")
+                    self.log(
+                        f"Still waiting for {len(locked_files)} files to be released...",
+                        "info",
+                    )
 
             time.sleep(3)
 
@@ -448,7 +561,7 @@ class Updater:
                 # Extra fallback just in case.
                 return os.getcwd()
         else:
-            return UpdateUtilities.find_root('README.md')
+            return UpdateUtilities.find_root("README.md")
 
     def create_updater_backup(self):
         """Save a `.backup` copy of this updater script so it can be restored if needed."""
@@ -484,7 +597,9 @@ class Updater:
 
             project_root = self.find_project_root()
             if not project_root:
-                raise Exception("Could not determine project root (README.md not found)")
+                raise Exception(
+                    "Could not determine project root (README.md not found)"
+                )
 
             self.log(f"Project root: {project_root}", "info")
 
@@ -493,11 +608,13 @@ class Updater:
             self.create_updater_backup()
 
             if not self.wait_for_main_app_closure():
-                self.log("Continuing update despite locked files (may fail)...", "warning")
+                self.log(
+                    "Continuing update despite locked files (may fail)...", "warning"
+                )
 
             self.set_progress(15, "Fetching release information...")
 
-            info = self.get_latest_release_info()
+            info = self.get_latest_release_info(self.target_tag, self.release_metadata)
             zip_url = info["zipball_url"]
             self.log(f"Found latest release: {info.get('tag_name', 'unknown')}", "info")
 
@@ -507,7 +624,7 @@ class Updater:
             response = requests.get(zip_url, stream=True)
             response.raise_for_status()
 
-            total_size = int(response.headers.get('content-length', 0))
+            total_size = int(response.headers.get("content-length", 0))
             self.log(f"Download size: {total_size / 1024 / 1024:.2f} MB", "info")
 
             with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp_file:
@@ -520,12 +637,17 @@ class Updater:
                         downloaded += len(chunk)
                         if total_size:
                             progress = 20 + (downloaded * 40 // total_size)
-                            self.set_progress(progress, f"Downloaded {downloaded / 1024 / 1024:.1f} MB")
+                            self.set_progress(
+                                progress,
+                                f"Downloaded {downloaded / 1024 / 1024:.1f} MB",
+                            )
+
+            self._verify_download_size(tmp_path, total_size, downloaded, "source archive")
 
             self.log(f"Download complete: {tmp_path}", "success")
             self.set_progress(60, "Extracting archive...")
 
-            with zipfile.ZipFile(tmp_path, 'r') as zip_ref:
+            with zipfile.ZipFile(tmp_path, "r") as zip_ref:
                 extract_dir = tempfile.mkdtemp()
                 self.log(f"Extracting to: {extract_dir}", "info")
                 zip_ref.extractall(extract_dir)
@@ -537,7 +659,10 @@ class Updater:
             # Fallback if the expected structure in the release zipball is not found
             # This will help in case the file structure changes between releases
             if not source_project_root:
-                self.log("Release zipball structure not found, trying main branch...", "warning")
+                self.log(
+                    "Release zipball structure not found, trying main branch...",
+                    "warning",
+                )
 
                 os.remove(tmp_path)
                 shutil.rmtree(extract_dir, ignore_errors=True)
@@ -548,9 +673,11 @@ class Updater:
                 response = requests.get(main_branch_url, stream=True)
                 response.raise_for_status()
 
-                total_size = int(response.headers.get('content-length', 0))
+                total_size = int(response.headers.get("content-length", 0))
 
-                with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp_file:
+                with tempfile.NamedTemporaryFile(
+                    suffix=".zip", delete=False
+                ) as tmp_file:
                     tmp_path = tmp_file.name
                     downloaded = 0
 
@@ -560,7 +687,12 @@ class Updater:
                             downloaded += len(chunk)
                             if total_size:
                                 progress = 25 + (downloaded * 35 // total_size)
-                                self.set_progress(progress, f"Downloaded {downloaded / 1024 / 1024:.1f} MB")
+                                self.set_progress(
+                                    progress,
+                                    f"Downloaded {downloaded / 1024 / 1024:.1f} MB",
+                                )
+
+                self._verify_download_size(tmp_path, total_size, downloaded, "fallback source archive")
 
                 with zipfile.ZipFile(tmp_path, 'r') as zip_ref:
                     extract_dir = tempfile.mkdtemp()
@@ -568,7 +700,9 @@ class Updater:
 
                 source_project_root = self._find_github_zipball_root(extract_dir)
                 if not source_project_root:
-                    raise Exception("Could not find project structure in either release or main branch")
+                    raise Exception(
+                        "Could not find project structure in either release or main branch"
+                    )
 
             self.log(f"Found source root: {source_project_root}", "success")
 
@@ -577,9 +711,16 @@ class Updater:
 
             self.set_progress(80, "Copying files...")
 
-            items_to_copy = ['assets', 'ImageMagick', 'src', 'latestVersion.txt', 'LICENSE', 'README.md']
+            items_to_copy = [
+                "assets",
+                "ImageMagick",
+                "src",
+                "latestVersion.txt",
+                "LICENSE",
+                "README.md",
+            ]
 
-            optional_items = ['.gitignore', '.github', 'docs', 'setup']
+            optional_items = [".gitignore", ".github", "docs", "setup"]
             for item in optional_items:
                 if os.path.exists(os.path.join(source_project_root, item)):
                     items_to_copy.append(item)
@@ -613,7 +754,9 @@ class Updater:
 
             self.set_progress(100, "Update complete!")
             self.log("Source code update completed successfully!", "success")
-            self.log("Please restart the application to use the updated version.", "info")
+            self.log(
+                "Please restart the application to use the updated version.", "info"
+            )
 
             def restart_app():
                 if self.ui:
@@ -622,7 +765,9 @@ class Updater:
                 main_py = os.path.join(project_root, "src", "Main.py")
                 if os.path.exists(main_py):
                     try:
-                        subprocess.Popen([sys.executable, main_py], cwd=os.path.dirname(main_py))
+                        subprocess.Popen(
+                            [sys.executable, main_py], cwd=os.path.dirname(main_py)
+                        )
                     except Exception:
                         pass
                 sys.exit(0)
@@ -671,28 +816,30 @@ class Updater:
                 self.log(f"Current executable: {current_exe}", "info")
 
             if not self.wait_for_main_app_closure():
-                self.log("Continuing update despite locked files (may fail)...", "warning")
+                self.log(
+                    "Continuing update despite locked files (may fail)...", "warning"
+                )
 
             self._ensure_write_permissions(app_root)
 
             self.set_progress(15, "Fetching release information...")
 
-            info = self.get_latest_release_info()
+            info = self.get_latest_release_info(self.target_tag, self.release_metadata)
             self.log(f"Found latest release: {info.get('tag_name', 'unknown')}", "info")
 
-            assets = info.get('assets', [])
+            assets = info.get("assets", [])
             seven_z_asset = None
 
             for asset in assets:
-                if asset['name'].lower().endswith('.7z'):
+                if asset["name"].lower().endswith(".7z"):
                     seven_z_asset = asset
                     break
 
             if not seven_z_asset:
                 raise Exception("No .7z release file found in latest release")
 
-            download_url = seven_z_asset['browser_download_url']
-            file_size = seven_z_asset.get('size', 0)
+            download_url = seven_z_asset["browser_download_url"]
+            file_size = seven_z_asset.get("size", 0)
 
             self.log(f"Downloading: {seven_z_asset['name']}", "info")
             self.log(f"Size: {file_size / 1024 / 1024:.2f} MB", "info")
@@ -712,7 +859,12 @@ class Updater:
                         downloaded += len(chunk)
                         if file_size:
                             progress = 20 + (downloaded * 40 // file_size)
-                            self.set_progress(progress, f"Downloaded {downloaded / 1024 / 1024:.1f} MB")
+                            self.set_progress(
+                                progress,
+                                f"Downloaded {downloaded / 1024 / 1024:.1f} MB",
+                            )
+
+            self._verify_download_size(tmp_path, file_size, downloaded, "executable archive")
 
             self.log(f"Download complete: {tmp_path}", "success")
             self.set_progress(60, "Extracting archive...")
@@ -721,7 +873,9 @@ class Updater:
             self.log(f"Extracting to: {extract_dir}", "info")
 
             if not UpdateUtilities.extract_7z(tmp_path, extract_dir):
-                raise Exception("Failed to extract 7z archive. Make sure py7zr is installed or 7z command is available.")
+                raise Exception(
+                    "Failed to extract 7z archive. Make sure py7zr is installed or 7z command is available."
+                )
 
             self.set_progress(70, "Detecting release structure...")
 
@@ -729,10 +883,12 @@ class Updater:
             self.log(f"Extracted contents: {', '.join(extracted_contents)}", "info")
 
             release_root = extract_dir
-            if len(extracted_contents) == 1 and os.path.isdir(os.path.join(extract_dir, extracted_contents[0])):
+            if len(extracted_contents) == 1 and os.path.isdir(
+                os.path.join(extract_dir, extracted_contents[0])
+            ):
                 potential_root = os.path.join(extract_dir, extracted_contents[0])
                 contents = os.listdir(potential_root)
-                if any(item.lower().endswith('.exe') for item in contents):
+                if any(item.lower().endswith(".exe") for item in contents):
                     release_root = potential_root
 
             release_contents = os.listdir(release_root)
@@ -748,7 +904,9 @@ class Updater:
 
             backup_dir = None
             if current_exe and os.path.exists(current_exe):
-                backup_dir = os.path.join(tempfile.gettempdir(), f"app_backup_{int(time.time())}")
+                backup_dir = os.path.join(
+                    tempfile.gettempdir(), f"app_backup_{int(time.time())}"
+                )
                 os.makedirs(backup_dir, exist_ok=True)
 
                 backup_exe = os.path.join(backup_dir, os.path.basename(current_exe))
@@ -756,12 +914,14 @@ class Updater:
                     shutil.copy2(current_exe, backup_exe)
                     self.log(f"Backed up current executable to: {backup_exe}", "info")
                 except Exception as e:
-                    self.log(f"Warning: Could not backup current executable: {e}", "warning")
+                    self.log(
+                        f"Warning: Could not backup current executable: {e}", "warning"
+                    )
 
-            items_to_copy = ['assets', 'ImageMagick', 'LICENSE', 'README.md']
+            items_to_copy = ["assets", "ImageMagick", "LICENSE", "README.md"]
             items_to_copy.extend(exe_files)
 
-            optional_items = ['docs', '.gitignore']
+            optional_items = ["docs", ".gitignore"]
             for item in optional_items:
                 if os.path.exists(os.path.join(release_root, item)):
                     items_to_copy.append(item)
@@ -779,7 +939,9 @@ class Updater:
                             else:
                                 shutil.copytree(src_path, dst_path)
                         else:
-                            if item.lower().endswith('.exe') and os.path.exists(dst_path):
+                            if item.lower().endswith(".exe") and os.path.exists(
+                                dst_path
+                            ):
                                 backup_name = dst_path + ".old"
                                 if os.path.exists(backup_name):
                                     try:
@@ -788,15 +950,21 @@ class Updater:
                                         pass
                                 try:
                                     os.rename(dst_path, backup_name)
-                                    self.log(f"Renamed old executable to {backup_name}", "info")
+                                    self.log(
+                                        f"Renamed old executable to {backup_name}",
+                                        "info",
+                                    )
                                 except Exception as e:
-                                    self.log(f"Could not rename old executable: {e}", "warning")
+                                    self.log(
+                                        f"Could not rename old executable: {e}",
+                                        "warning",
+                                    )
 
                             self._copy_file_with_retry(src_path, dst_path)
                         self.log(f"Successfully installed {item}", "success")
                     except Exception as e:
                         self.log(f"Failed to install {item}: {str(e)}", "error")
-                        if item.lower().endswith('.exe'):
+                        if item.lower().endswith(".exe"):
                             raise e
                 else:
                     self.log(f"Warning: {item} not found in release", "warning")
@@ -807,7 +975,9 @@ class Updater:
 
             self.set_progress(100, "Update complete!")
             self.log("Executable update completed successfully!", "success")
-            self.log("Please restart the application to use the updated version.", "info")
+            self.log(
+                "Please restart the application to use the updated version.", "info"
+            )
 
             def restart_app():
                 if self.ui:
@@ -831,25 +1001,40 @@ class Updater:
 
                         if UpdateUtilities.is_compiled():
                             # For Nuitka executables, try with shell=True for better compatibility
-                            process = subprocess.Popen([main_exe], cwd=app_root, shell=True)
-                            self.log(f"Started process with PID: {process.pid}", "success")
+                            process = subprocess.Popen(
+                                [main_exe], cwd=app_root, shell=True
+                            )
+                            self.log(
+                                f"Started process with PID: {process.pid}", "success"
+                            )
                         else:
                             # For non-Nuitka (shouldn't happen in exe mode but just in case)
                             process = subprocess.Popen([main_exe], cwd=app_root)
-                            self.log(f"Started process with PID: {process.pid}", "success")
+                            self.log(
+                                f"Started process with PID: {process.pid}", "success"
+                            )
 
-                        self.log("Application restart initiated successfully", "success")
+                        self.log(
+                            "Application restart initiated successfully", "success"
+                        )
 
                         # Give the process a moment to start
                         import time
+
                         time.sleep(2)
 
                     except Exception as e:
                         self.log(f"Failed to restart application: {e}", "error")
-                        self.log(f"Please manually start the application from: {main_exe}", "warning")
+                        self.log(
+                            f"Please manually start the application from: {main_exe}",
+                            "warning",
+                        )
                 else:
                     self.log("No executable found to restart", "error")
-                    self.log(f"Available files in {app_root}: {', '.join(os.listdir(app_root))}", "info")
+                    self.log(
+                        f"Available files in {app_root}: {', '.join(os.listdir(app_root))}",
+                        "info",
+                    )
 
                 sys.exit(0)
 
@@ -865,7 +1050,7 @@ class Updater:
         """Recursively copy a tree from `src_dir` into `dst_dir`, overwriting file contents."""
         for root, dirs, files in os.walk(src_dir):
             rel_path = os.path.relpath(root, src_dir)
-            if rel_path == '.':
+            if rel_path == ".":
                 target_dir = dst_dir
             else:
                 target_dir = os.path.join(dst_dir, rel_path)
@@ -883,38 +1068,64 @@ class Updater:
             try:
                 os.makedirs(os.path.dirname(dst_file), exist_ok=True)
 
-                if dst_file.lower().endswith('.dll') and os.path.exists(dst_file):
+                if dst_file.lower().endswith(".dll") and os.path.exists(dst_file):
                     backup_dll = dst_file + ".old"
                     try:
                         if os.path.exists(backup_dll):
                             os.remove(backup_dll)
                         os.rename(dst_file, backup_dll)
-                        self.log(f"Backed up existing DLL: {os.path.basename(dst_file)}", "info")
+                        self.log(
+                            f"Backed up existing DLL: {os.path.basename(dst_file)}",
+                            "info",
+                        )
                     except Exception as e:
-                        self.log(f"Could not backup DLL {os.path.basename(dst_file)}: {e}", "warning")
+                        self.log(
+                            f"Could not backup DLL {os.path.basename(dst_file)}: {e}",
+                            "warning",
+                        )
 
                 shutil.copy2(src_file, dst_file)
                 return
 
             except (PermissionError, OSError) as e:
                 if attempt < max_attempts - 1:
-                    self.log(f"Copy attempt {attempt + 1} failed for {os.path.basename(dst_file)}: {e}", "warning")
+                    self.log(
+                        f"Copy attempt {attempt + 1} failed for {os.path.basename(dst_file)}: {e}",
+                        "warning",
+                    )
                     self.log("Waiting before retry...", "info")
                     time.sleep(3)
                 else:
-                    if dst_file.lower().endswith('.dll'):
+                    if dst_file.lower().endswith(".dll"):
                         try:
                             temp_name = dst_file + ".new"
                             shutil.copy2(src_file, temp_name)
                             if os.path.exists(dst_file):
                                 os.remove(dst_file)
                             os.rename(temp_name, dst_file)
-                            self.log(f"Successfully updated DLL using temp file method: {os.path.basename(dst_file)}", "success")
+                            self.log(
+                                f"Successfully updated DLL using temp file method: {os.path.basename(dst_file)}",
+                                "success",
+                            )
                             return
 
                         except Exception as temp_e:
-                            self.log(f"Temp file method also failed for {os.path.basename(dst_file)}: {temp_e}", "error")
+                            self.log(
+                                f"Temp file method also failed for {os.path.basename(dst_file)}: {temp_e}",
+                                "error",
+                            )
                     raise e
+
+    @staticmethod
+    def _verify_download_size(file_path, expected_size, recorded_size, label):
+        """Ensure the downloaded file size matches GitHub's reported size when available."""
+        if not expected_size:
+            return
+        actual_size = os.path.getsize(file_path)
+        if actual_size != expected_size or (recorded_size and recorded_size != expected_size):
+            raise IOError(
+                f"{label} integrity check failed (expected {expected_size} bytes, got {actual_size})."
+            )
 
     def _ensure_write_permissions(self, target_dir):
         """Request elevation when the updater lacks permission to modify `target_dir`."""
@@ -969,32 +1180,52 @@ class UpdateInstaller:
             raise ImportError("PySide6 is required for the integrated updater UI")
         self.parent = parent
 
-    def download_and_install(self, download_url=None, latest_version=None, parent_window=None, exe_mode=None):
+    def download_and_install(
+        self,
+        release_metadata=None,
+        latest_version=None,
+        parent_window=None,
+        exe_mode=None,
+    ):
         """Launch the updater dialog and run the appropriate update flow."""
 
         dialog_parent = parent_window or self.parent
         QApplication.instance() or QApplication(sys.argv)
         dialog = QtUpdateDialog(dialog_parent)
         exe_mode = UpdateUtilities.is_compiled() if exe_mode is None else exe_mode
-        updater = Updater(ui=dialog, exe_mode=exe_mode)
+        metadata = release_metadata or {}
+        updater = Updater(
+            ui=dialog,
+            exe_mode=exe_mode,
+            target_tag=metadata.get("tag_name"),
+            release_metadata=metadata,
+        )
 
         mode_label = "executable" if exe_mode else "source"
         dialog.log(f"Starting {mode_label} update...", "info")
+        dialog.log(f"Currently running version {APP_VERSION}", "info")
         if latest_version:
             dialog.log(f"Target version: {latest_version}", "info")
-        if download_url:
+        if metadata.get("zipball_url"):
+            dialog.log(f"Download URL available: {metadata['zipball_url'][:60]}...", "info")
+        else:
             dialog.log(
-                "Fetch the latest release.",
+                "No download URL provided; falling back to GitHub release discovery.",
                 "warning",
             )
 
         def _run_update():
             try:
+                print(f"[Worker Thread] Starting {mode_label} update...")
                 if exe_mode:
                     updater.update_exe()
                 else:
                     updater.update_source()
+                print("[Worker Thread] Update completed successfully")
             except Exception as err:
+                print(f"[Worker Thread] Error: {err}")
+                import traceback
+                traceback.print_exc()
                 dialog.log(f"Update process encountered an error: {err}", "error")
                 dialog.allow_close()
             else:
@@ -1002,7 +1233,9 @@ class UpdateInstaller:
 
         worker = threading.Thread(target=_run_update, daemon=True)
         worker.start()
+        print(f"[Main Thread] Worker thread started, entering dialog.exec()")
         dialog.exec()
+        print(f"[Main Thread] Dialog closed")
 
 
 def main():
@@ -1010,6 +1243,8 @@ def main():
     parser.add_argument("--no-gui", action="store_true", help="Run in console mode without GUI")
     parser.add_argument("--exe-mode", action="store_true", help="Run in executable update mode")
     parser.add_argument("--wait", type=int, default=3, help="Seconds to wait before starting update")
+    parser.add_argument("--metadata-file", help="Path to release metadata JSON", default=None)
+    parser.add_argument("--latest-version", help="Target version label", default=None)
 
     args = parser.parse_args()
 
@@ -1017,12 +1252,32 @@ def main():
         print(f"Waiting {args.wait} seconds for main application to close...")
         time.sleep(args.wait)
 
+    release_metadata = None
+    if args.metadata_file:
+        metadata_path = Path(args.metadata_file)
+        try:
+            release_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        finally:
+            try:
+                metadata_path.unlink()
+            except OSError:
+                pass
+
     if not args.no_gui and QT_AVAILABLE:
         installer = UpdateInstaller()
-        installer.download_and_install(exe_mode=args.exe_mode)
+        installer.download_and_install(
+            release_metadata=release_metadata,
+            latest_version=args.latest_version,
+            exe_mode=args.exe_mode,
+        )
         return
 
-    updater = Updater(ui=None, exe_mode=args.exe_mode)
+    updater = Updater(
+        ui=None,
+        exe_mode=args.exe_mode,
+        target_tag=(release_metadata or {}).get("tag_name"),
+        release_metadata=release_metadata,
+    )
     if args.exe_mode:
         updater.update_exe()
     else:
