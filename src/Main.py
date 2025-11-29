@@ -1150,5 +1150,111 @@ def main():
     sys.exit(app.exec())
 
 
+def run_updater(exe_mode: bool, wait_seconds: int = 3, target_tag: str = None):
+    """Run the updater in a separate process context with Qt GUI."""
+    import time
+    import json
+    import threading
+    from utils.update_installer import Updater
+
+    # Import QtUpdateDialog - it's available since Qt is required for Main.py
+    try:
+        from utils.update_installer import QtUpdateDialog
+    except ImportError:
+        print("Error: Qt components not available for updater dialog")
+        return
+
+    print("Starting update process...")
+    if wait_seconds > 0:
+        print(f"Waiting {wait_seconds} seconds for main app to close...")
+        time.sleep(wait_seconds)
+
+    # Check for metadata file passed via environment
+    release_metadata = {}
+    metadata_path = os.environ.get("UPDATER_METADATA_FILE")
+    if metadata_path and os.path.exists(metadata_path):
+        try:
+            with open(metadata_path, "r", encoding="utf-8") as f:
+                release_metadata = json.load(f)
+            print(f"Loaded release metadata from {metadata_path}")
+            # Clean up after reading
+            os.remove(metadata_path)
+        except Exception as e:
+            print(f"Warning: Could not load metadata file: {e}")
+
+    # Create Qt application for the updater dialog
+    app = QApplication.instance() or QApplication(sys.argv)
+    app.setApplicationName("TextureAtlas Toolbox Updater")
+    app.setApplicationVersion(APP_VERSION)
+
+    # Create and show the update dialog
+    dialog = QtUpdateDialog(None)
+
+    # Create updater with the dialog as UI
+    updater = Updater(
+        ui=dialog,
+        exe_mode=exe_mode,
+        target_tag=target_tag or release_metadata.get("tag_name"),
+        release_metadata=release_metadata,
+    )
+
+    mode_label = "executable" if exe_mode else "source"
+    dialog.log(f"Starting {mode_label} update...", "info")
+    dialog.log(f"Currently running version {APP_VERSION}", "info")
+    if target_tag:
+        dialog.log(f"Target version: {target_tag}", "info")
+
+    def _run_update():
+        try:
+            print(f"[Worker Thread] Starting {mode_label} update...")
+            if exe_mode:
+                updater.update_exe()
+            else:
+                updater.update_source()
+            print("[Worker Thread] Update completed successfully")
+        except Exception as err:
+            print(f"[Worker Thread] Error: {err}")
+            import traceback
+            traceback.print_exc()
+            dialog.log(f"Update process encountered an error: {err}", "error")
+            dialog.allow_close()
+        else:
+            dialog.allow_close()
+
+    # Run update in a separate thread so dialog stays responsive
+    worker = threading.Thread(target=_run_update, daemon=True)
+    worker.start()
+
+    # Show dialog and block until closed
+    dialog.exec()
+    print("[Main Thread] Updater dialog closed")
+
+
 if __name__ == "__main__":
-    main()
+    import argparse
+    from utils.update_installer import UpdateUtilities
+
+    try:
+        parser = argparse.ArgumentParser(description="TextureAtlas Toolbox")
+        parser.add_argument("--update", action="store_true", help="Run in update mode")
+        parser.add_argument("--exe-mode", action="store_true", help="Force executable update mode")
+        parser.add_argument("--target-tag", type=str, default=None, help="Target version tag to update to")
+        parser.add_argument(
+            "--wait", type=int, default=3, help="Seconds to wait before starting update"
+        )
+        args = parser.parse_args()
+
+        if args.update:
+            # Update mode: run the updater instead of the main app
+            exe_mode = args.exe_mode or UpdateUtilities.is_compiled()
+            run_updater(exe_mode=exe_mode, wait_seconds=args.wait, target_tag=args.target_tag)
+        else:
+            # Normal mode: run the main application
+            print("Starting main application...")
+            main()
+
+    except Exception as e:
+        print(f"Fatal error during startup: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)

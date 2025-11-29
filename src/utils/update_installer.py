@@ -174,6 +174,63 @@ class UpdateUtilities:
     """Helper methods shared by the updater for filesystem and packaging tasks."""
 
     @staticmethod
+    def apply_pending_updates(search_dir=None):
+        """
+        Apply any pending .new files from a previous update.
+        
+        This should be called at application startup to complete
+        deferred file replacements that couldn't happen while the
+        previous instance was running.
+        
+        Returns:
+            list: Tuples of (new_file, target_file, success) for each processed file.
+        """
+        if search_dir is None:
+            # Default to the src directory
+            search_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        
+        results = []
+        
+        # Find all .new files recursively
+        for root, _dirs, files in os.walk(search_dir):
+            for filename in files:
+                if filename.endswith('.new'):
+                    new_file = os.path.join(root, filename)
+                    # Target is the same path without .new extension
+                    target_file = new_file[:-4]  # Remove '.new'
+                    
+                    try:
+                        # Try to apply the pending update
+                        if os.path.exists(target_file):
+                            # Create backup
+                            backup_file = target_file + '.bak'
+                            try:
+                                if os.path.exists(backup_file):
+                                    os.remove(backup_file)
+                                os.rename(target_file, backup_file)
+                            except Exception:
+                                # If we can't backup, try direct removal
+                                os.remove(target_file)
+                        
+                        # Rename .new to target
+                        os.rename(new_file, target_file)
+                        
+                        # Clean up backup if successful
+                        backup_file = target_file + '.bak'
+                        if os.path.exists(backup_file):
+                            try:
+                                os.remove(backup_file)
+                            except Exception:
+                                pass  # Non-critical
+                        
+                        results.append((new_file, target_file, True))
+                    except Exception as e:
+                        print(f"Failed to apply pending update {new_file}: {e}")
+                        results.append((new_file, target_file, False))
+        
+        return results
+
+    @staticmethod
     def find_root(target_name):
         """Walk upward from this file until `target_name` is found and return that directory."""
         root_path = os.path.abspath(__file__)
@@ -304,15 +361,19 @@ def launch_external_updater(
     exe_mode=False,
     wait_seconds=3,
 ):
-    """Spawn a fresh Python process to run the updater with optional metadata.
+    """Spawn a fresh Python process to run the updater via Main.py --update.
 
     The updater runs as a completely separate process so it can replace
-    files after the main application exits.
+    files (including Main.py itself) after the main application exits.
     """
 
     script_path = Path(__file__).resolve()
     project_root = script_path.parents[2]
-    args = [sys.executable, str(script_path)]
+    
+    # Run Main.py with --update flag instead of update_installer.py directly
+    # This allows Main.py to update itself since the old process will be gone
+    main_py = project_root / "src" / "Main.py"
+    args = [sys.executable, str(main_py), "--update"]
 
     if wait_seconds is not None:
         args.extend(["--wait", str(wait_seconds)])
@@ -320,12 +381,14 @@ def launch_external_updater(
     if exe_mode:
         args.append("--exe-mode")
 
+    if latest_version:
+        args.extend(["--target-tag", latest_version])
+
+    # Write metadata for the new process to use
     if release_metadata:
         metadata_path = _write_metadata_file(release_metadata)
-        args.extend(["--metadata-file", str(metadata_path)])
-
-    if latest_version:
-        args.extend(["--latest-version", latest_version])
+        # Store path in environment for the updater to find
+        os.environ["UPDATER_METADATA_FILE"] = str(metadata_path)
 
     print(f"Launching external updater: {' '.join(args)}")
     print(f"Working directory: {project_root}")
@@ -1088,6 +1151,9 @@ class Updater:
 
         # First, copy all files from source to destination
         files_copied = 0
+        files_failed = 0
+        important_files = []  # Track important files like Main.py
+        
         for root, dirs, files in os.walk(src_dir):
             rel_path = os.path.relpath(root, src_dir)
             if rel_path == ".":
@@ -1100,10 +1166,29 @@ class Updater:
             for file in files:
                 src_file = os.path.join(root, file)
                 dst_file = os.path.join(target_dir, file)
-                self._copy_file_with_retry(src_file, dst_file)
-                files_copied += 1
+                
+                # Track important files
+                if file.lower() in ('main.py', '__init__.py', 'version.py', 'update_installer.py', 'update_checker.py'):
+                    rel_file_path = os.path.join(rel_path, file) if rel_path != "." else file
+                    important_files.append(rel_file_path)
+                
+                try:
+                    success = self._copy_file_with_retry(src_file, dst_file)
+                    if success:
+                        files_copied += 1
+                    else:
+                        files_failed += 1
+                except Exception as e:
+                    self.log(f"ERROR copying {file}: {e}", "error")
+                    files_failed += 1
 
         self.log(f"Copied {files_copied} files to {os.path.basename(dst_dir)}", "info")
+        if files_failed > 0:
+            self.log(f"Failed to copy {files_failed} files", "warning")
+        
+        # Log important files that were updated
+        if important_files:
+            self.log(f"Key files processed: {', '.join(important_files)}", "success")
 
         # Then, remove files in destination that don't exist in source
         # This cleans up old files that were removed in the new version
@@ -1141,58 +1226,91 @@ class Updater:
             self.log(f"Cleaned up {files_removed} obsolete files", "info")
 
     def _copy_file_with_retry(self, src_file, dst_file, max_attempts=5):
-        """Copy a file with retry/backoff logic, handling locked DLLs when necessary."""
+        """Copy a file with retry/backoff logic, handling locked files."""
+        filename = os.path.basename(dst_file)
+        file_ext = os.path.splitext(filename)[1].lower()
+
+        # Files that might be locked and need special handling
+        lockable_extensions = {'.dll', '.exe', '.py', '.pyd', '.so'}
+        is_lockable = file_ext in lockable_extensions
+
         for attempt in range(max_attempts):
             try:
                 os.makedirs(os.path.dirname(dst_file), exist_ok=True)
 
-                if dst_file.lower().endswith(".dll") and os.path.exists(dst_file):
-                    backup_dll = dst_file + ".old"
+                # For lockable files that exist, try backup/rename strategy first
+                if is_lockable and os.path.exists(dst_file):
+                    backup_name = dst_file + ".old"
                     try:
-                        if os.path.exists(backup_dll):
-                            os.remove(backup_dll)
-                        os.rename(dst_file, backup_dll)
-                        self.log(
-                            f"Backed up existing DLL: {os.path.basename(dst_file)}",
-                            "info",
-                        )
+                        if os.path.exists(backup_name):
+                            os.remove(backup_name)
+                        os.rename(dst_file, backup_name)
+                        self.log(f"Backed up existing file: {filename}", "info")
+                    except PermissionError:
+                        # File is locked, will try direct copy anyway
+                        self.log(f"Could not backup {filename} (file in use), attempting direct overwrite", "warning")
                     except Exception as e:
-                        self.log(
-                            f"Could not backup DLL {os.path.basename(dst_file)}: {e}",
-                            "warning",
-                        )
+                        self.log(f"Could not backup {filename}: {e}", "warning")
 
                 shutil.copy2(src_file, dst_file)
-                return
+                
+                # Clean up backup if copy succeeded
+                backup_name = dst_file + ".old"
+                if os.path.exists(backup_name):
+                    try:
+                        os.remove(backup_name)
+                    except Exception:
+                        pass  # Not critical if we can't remove the backup
+                
+                return True
 
             except (PermissionError, OSError) as e:
                 if attempt < max_attempts - 1:
                     self.log(
-                        f"Copy attempt {attempt + 1} failed for {os.path.basename(dst_file)}: {e}",
+                        f"Copy attempt {attempt + 1}/{max_attempts} failed for {filename}: {e}",
                         "warning",
                     )
-                    self.log("Waiting before retry...", "info")
+                    self.log("Waiting 3 seconds before retry...", "info")
                     time.sleep(3)
                 else:
-                    if dst_file.lower().endswith(".dll"):
+                    # Last attempt - try temp file method for lockable files
+                    if is_lockable:
                         try:
                             temp_name = dst_file + ".new"
+                            self.log(f"Trying temp file method for {filename}...", "info")
                             shutil.copy2(src_file, temp_name)
-                            if os.path.exists(dst_file):
-                                os.remove(dst_file)
+                            
+                            # Try to remove original and rename temp
+                            try:
+                                if os.path.exists(dst_file):
+                                    os.remove(dst_file)
+                            except PermissionError:
+                                # Can't remove original, but temp is ready
+                                # On next app start, the .new file will be there
+                                self.log(
+                                    f"Created {filename}.new - original file locked. "
+                                    "New version will be available after restart.",
+                                    "warning"
+                                )
+                                return True
+                            
                             os.rename(temp_name, dst_file)
                             self.log(
-                                f"Successfully updated DLL using temp file method: {os.path.basename(dst_file)}",
+                                f"Successfully updated {filename} using temp file method",
                                 "success",
                             )
-                            return
+                            return True
 
                         except Exception as temp_e:
                             self.log(
-                                f"Temp file method also failed for {os.path.basename(dst_file)}: {temp_e}",
+                                f"All methods failed for {filename}: {temp_e}",
                                 "error",
                             )
+                    
+                    self.log(f"Failed to copy {filename} after {max_attempts} attempts: {e}", "error")
                     raise e
+        
+        return False
 
     @staticmethod
     def _verify_download_size(file_path, expected_size, recorded_size, label):
